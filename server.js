@@ -4,6 +4,10 @@ const bodyParser = require("body-parser");
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
+app.get("/", (req,res)=>{
+res.send("IVR server running");
+});
+
 app.all("/ivr",(req,res)=>{
 
 res.type("text/xml");
