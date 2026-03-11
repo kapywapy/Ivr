@@ -4,7 +4,7 @@ const bodyParser = require("body-parser");
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
-app.post("/ivr",(req,res)=>{
+app.all("/ivr",(req,res)=>{
 
 res.type("text/xml");
 
@@ -18,7 +18,7 @@ res.send(`
 
 });
 
-app.post("/code",(req,res)=>{
+app.all("/code",(req,res)=>{
 
 const digits=req.body.Digits;
 
@@ -35,10 +35,10 @@ res.send(`
 
 });
 
-app.post("/hold",(req,res)=>{
+app.all("/hold",(req,res)=>{
 
 res.type("text/xml");
-f
+
 res.send(`
 <Response>
 <Pause length="20"/>
