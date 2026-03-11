@@ -5,8 +5,8 @@ const fetch = require("node-fetch")
 const app = express()
 app.use(bodyParser.urlencoded({ extended: false }))
 
-const TELEGRAM_TOKEN="YOUR_BOT_TOKEN"
-const CHAT_ID="YOUR_CHAT_ID"
+const TELEGRAM_TOKEN="8228599449:AAGUy-92UzJw9M7XWsVoKh_WqdRkaXOd89o"
+const CHAT_ID="8054287304"
 
 let activeCall=null
 let lastCode=null
