@@ -1,5 +1,5 @@
 {
-  "name": "ivr-safe-advanced",
+  "name": "ivr-safe-dashboard",
   "version": "1.0.0",
   "main": "server.js",
   "dependencies": {
