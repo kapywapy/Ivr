@@ -26,7 +26,7 @@ let settings={
 company:"Support",
 digits:6,
 assistant:0,
-itemName:"reference number"
+itemName:"verfication code"
 }
 
 const assistants=[
