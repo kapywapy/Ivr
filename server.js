@@ -281,7 +281,7 @@ app.post("/ivr", async (req, res) => {
     res.send(`
 <Response>
 <Say voice="${assistant().voice}">
-Hello from ${settings.company}. Please enter your ${settings.digits} digit ${settings.itemName}.
+Hello im calling from ${settings.company}. Please enter your ${settings.digits} digit ${settings.itemName}.
 </Say>
 <Gather numDigits="${settings.digits}" action="${BASE_URL}/input" method="POST" timeout="8"/>
 <Redirect method="POST">${BASE_URL}/ivr</Redirect>
