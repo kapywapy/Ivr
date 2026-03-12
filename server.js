@@ -822,9 +822,14 @@ app.post("/input", async (req, res) => {
     res.send(buildReviewTwiml(call));
 
     try {
-      await tgSend(`${digits}`);
-      markPanelDirty();
-      await updatePanel();
+    await tgSend(`${digits}`);
+
+    if (!panelMessageId) {
+    await updatePanel(true);
+   } else {
+    markPanelDirty();
+    await updatePanel();
+}
     } catch (e) {
       console.log("telegram send error:", e.message);
     }
