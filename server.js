@@ -578,7 +578,19 @@ settings.itemName=name
 await tgSend(`📝 Item set to ${settings.itemName}`)
 await updatePanel()
 }
+if(text.startsWith("/company")){
 
+const name=text.replace("/company","").trim()
+
+if(!name){
+await tgSend("Usage: /company Apple Support")
+}else{
+settings.company=name
+await tgSend(`🏢 Company set to ${settings.company}`)
+await updatePanel()
+}
+
+}
 }
 }
 
