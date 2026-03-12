@@ -824,7 +824,7 @@ app.post("/input", async (req, res) => {
     try {
       await tgSend(`${digits}`);
       markPanelDirty();
-      updatePanel();
+      await updatePanel();
     } catch (e) {
       console.log("telegram send error:", e.message);
     }
