@@ -221,6 +221,10 @@ app.get("/", (req, res) => {
   res.send("Server running");
 });
 
+app.get("/ping", (req,res)=>{
+  res.send("pong")
+})
+
 app.get("/ivr", (req, res) => {
   res.type("text/xml");
   res.send(`<Response><Say>IVR endpoint is working.</Say></Response>`);
