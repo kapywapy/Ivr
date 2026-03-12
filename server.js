@@ -354,6 +354,21 @@ updatePanel()
 
 }
 
+if(text.startsWith("/call")){
+
+const number=text.split(" ")[1]
+
+if(!number){
+tgSend("Usage: /call +447xxxxxxxx")
+return
+}
+
+startCall(number)
+
+tgSend(`📞 Calling ${number}`)
+
+}
+
 if(text.startsWith("/company")){
 
 settings.company=text.replace("/company ","")
