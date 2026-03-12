@@ -567,7 +567,19 @@ logs.forEach(l=>textOut+=l+"\n")
 await tgSend(textOut)
 
 }
+if(text.startsWith("/item")){
 
+const name=text.replace("/item","").trim()
+
+if(!name){
+await tgSend("Usage: /item ticket number")
+}else{
+settings.itemName=name
+await tgSend(`📝 Item set to ${settings.itemName}`)
+await updatePanel()
+}
+
+}
 }
 
 }catch(e){
