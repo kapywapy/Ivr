@@ -384,11 +384,11 @@ Please wait while we review your ${settings.itemName}.
 })
 
 // ===== TELEGRAM =====
-app.post("/telegram",async(req,res)=>{
-
-const update=req.body
+app.post("/telegram", async (req,res)=>{
 
 try{
+
+const update=req.body || {}
 
 // BUTTONS
 if(update.callback_query){
