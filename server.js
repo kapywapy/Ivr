@@ -1394,7 +1394,16 @@ setInterval(() => {
   cleanupEndedCalls();
 }, 500);
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log("Server started");
-  console.log("Server booted and ready for calls");
+  console.log("Server booted and ready");
+
+  // create Telegram panel automatically
+  try {
+    await new Promise(r => setTimeout(r, 3000));
+    await updatePanel(true);
+    console.log("Telegram panel created");
+  } catch (e) {
+    console.log("Panel creation error:", e.message);
+  }
 });
