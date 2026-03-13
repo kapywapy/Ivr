@@ -1144,7 +1144,8 @@ app.post("/telegram", async (req, res) => {
 
       if (text === "/panel" || text === "/menu" || text === "/status") {
         panelMessageId = null;
-        await updatePanel(true, role);
+        const chatId = update.message.chat.id;
+        await updatePanel(true, role, chatId);
         return res.sendStatus(200);
       }
 
