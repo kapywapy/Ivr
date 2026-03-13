@@ -1606,12 +1606,20 @@ Scheduled: ${db.stats.scheduledCalls}`);
 // LIVE PANEL LOOP
 // ============================================================
 
-setInterval(() => {
-  if (panelDirty && panelMessageId) {
+setInterval(async () => {
+
+  if (panelDirty) {
+
     panelDirty = false;
-    updatePanel(false, "owner");
+
+    for (const chatId of Object.keys(panelMessageIds)) {
+      await updatePanel(false, "admin", chatId);
+    }
+
   }
+
   cleanupEndedCalls();
+
 }, 300);
 
 // ============================================================
