@@ -343,15 +343,32 @@ async function tg(method, data) {
   return res.json();
 }
 
-async function tgSend(text, buttons = null, chatId = CHAT_ID) {
-  const body = {
-    chat_id: chatId,
-    text
-  };
-  if (buttons) {
-    body.reply_markup = { inline_keyboard: buttons };
+async function tgSend(text, buttons = null, update = null) {
+
+  const targets = new Set();
+
+  if (OWNER_ID) targets.add(String(OWNER_ID));
+
+  (db.admins || []).forEach(id => targets.add(String(id)));
+
+  if (update) {
+    const userId = getUserId(update);
+    if (userId) targets.add(String(userId));
   }
-  return tg("sendMessage", body);
+
+  for (const chatId of targets) {
+
+    const body = {
+      chat_id: chatId,
+      text
+    };
+
+    if (buttons) {
+      body.reply_markup = { inline_keyboard: buttons };
+    }
+
+    await tg("sendMessage", body).catch(() => {});
+  }
 }
 
 async function tgEdit(messageId, text, buttons = null) {
