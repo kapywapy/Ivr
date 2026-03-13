@@ -525,36 +525,36 @@ function panelText(role = "admin") {
   return lines.join("\n");
 }
 
-async function updatePanel(forceNew = false, role = "admin") {
+async function updatePanel(forceNew = false, role = "admin", chatId = CHAT_ID) {
+
   try {
+
     const text = panelText(role);
     const buttons = panelButtons(role);
 
-    if (!panelMessageId || forceNew) {
-      const msg = await tgSend(text, buttons);
+    let messageId = panelMessageIds[chatId];
+
+    if (!messageId || forceNew) {
+
+      const msg = await tgSend(text, buttons, chatId);
+
       if (msg && msg.result && msg.result.message_id) {
-        panelMessageId = msg.result.message_id;
+        panelMessageIds[chatId] = msg.result.message_id;
       }
+
       return;
     }
 
-    const result = await tgEdit(panelMessageId, text, buttons);
+    const result = await tgEdit(chatId, messageId, text, buttons);
 
     if (!result || result.ok === false) {
-      panelBrokenCount++;
-      if (panelBrokenCount >= 2) {
-        panelMessageId = null;
-        await updatePanel(true, role);
-      }
-    } else {
-      panelBrokenCount = 0;
+      delete panelMessageIds[chatId];
     }
-  } catch {
-    panelBrokenCount++;
-    if (panelBrokenCount >= 2) {
-      panelMessageId = null;
-    }
+
+  } catch (e) {
+    delete panelMessageIds[chatId];
   }
+
 }
 
 // ============================================================
