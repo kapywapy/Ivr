@@ -327,11 +327,18 @@ async function tg(method, data) {
   return res.json();
 }
 
-async function tgSend(text, buttons = null) {
+async function tgSend(text, buttons = null, chatId = CHAT_ID) {
   const body = {
-    chat_id: CHAT_ID,
+    chat_id: chatId,
     text
   };
+
+  if (buttons) {
+    body.reply_markup = { inline_keyboard: buttons };
+  }
+
+  return tg("sendMessage", body);
+}
   if (buttons) {
     body.reply_markup = { inline_keyboard: buttons };
   }
