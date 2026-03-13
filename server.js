@@ -154,7 +154,7 @@ const quickDialTargets = {
 
 const calls = new Map();
 
-let panelMessageId = null;
+let panelMessageIds = {};
 let panelDirty = false;
 let panelBrokenCount = 0;
 
