@@ -151,7 +151,7 @@ const quickDialTargets = {
 
 const calls = new Map();
 
-const panelMessageIds = {};
+let panelMessageId = null;
 let panelDirty = false;
 let panelBrokenCount = 0;
 
@@ -314,13 +314,6 @@ function toCsv(rows) {
   return header + body;
 }
 
-function getChatId(update) {
-  return (
-    update?.message?.chat?.id ||
-    update?.callback_query?.message?.chat?.id ||
-    CHAT_ID
-  );
-}
 // ============================================================
 // TELEGRAM API
 // ============================================================
@@ -334,36 +327,23 @@ async function tg(method, data) {
   return res.json();
 }
 
-async function tgSend(text, buttons = null, chatId = CHAT_ID) {
+async function tgSend(text, buttons = null) {
   const body = {
-    chat_id: chatId,
+    chat_id: CHAT_ID,
     text
   };
-
-  if (buttons) {
-    body.reply_markup = { inline_keyboard: buttons };
-  }
-
-  return tg("sendMessage", body);
-}
   if (buttons) {
     body.reply_markup = { inline_keyboard: buttons };
   }
   return tg("sendMessage", body);
 }
 
-async function tgEdit(chatId, messageId, text, buttons = null) {
+async function tgEdit(messageId, text, buttons = null) {
   const body = {
-    chat_id: chatId,
+    chat_id: CHAT_ID,
     message_id: messageId,
     text
   };
-  if (buttons) {
-    body.reply_markup = { inline_keyboard: buttons };
-  }
-
-  return tg("editMessageText", body);
-}
   if (buttons) {
     body.reply_markup = { inline_keyboard: buttons };
   }
