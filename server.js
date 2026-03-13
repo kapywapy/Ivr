@@ -151,7 +151,7 @@ const quickDialTargets = {
 
 const calls = new Map();
 
-let panelMessageId = null;
+const panelMessageIds = {};
 let panelDirty = false;
 let panelBrokenCount = 0;
 
@@ -314,6 +314,13 @@ function toCsv(rows) {
   return header + body;
 }
 
+function getChatId(update) {
+  return (
+    update?.message?.chat?.id ||
+    update?.callback_query?.message?.chat?.id ||
+    CHAT_ID
+  );
+}
 // ============================================================
 // TELEGRAM API
 // ============================================================
