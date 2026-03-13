@@ -404,7 +404,7 @@ async function tgSendDocument(filename, contentBuffer) {
 
   pushString(`--${boundary}\r\n`);
   pushString(`Content-Disposition: form-data; name="chat_id"\r\n\r\n`);
-  pushString(`${CHAT_ID}\r\n`);
+  pushString(`${OWNER_ID}\r\n`);
 
   pushString(`--${boundary}\r\n`);
   pushString(`Content-Disposition: form-data; name="document"; filename="${filename}"\r\n`);
