@@ -352,12 +352,18 @@ async function tgSend(text, buttons = null, chatId = CHAT_ID) {
   return tg("sendMessage", body);
 }
 
-async function tgEdit(messageId, text, buttons = null) {
+async function tgEdit(chatId, messageId, text, buttons = null) {
   const body = {
-    chat_id: CHAT_ID,
+    chat_id: chatId,
     message_id: messageId,
     text
   };
+  if (buttons) {
+    body.reply_markup = { inline_keyboard: buttons };
+  }
+
+  return tg("editMessageText", body);
+}
   if (buttons) {
     body.reply_markup = { inline_keyboard: buttons };
   }
