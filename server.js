@@ -1214,6 +1214,7 @@ app.post("/telegram", async (req, res) => {
     // Text commands
     // -------------------------
     if (update.message && update.message.text) {
+    const text = update.message.text.trim();
 
 
 if (text.startsWith("/addadmin")) {
