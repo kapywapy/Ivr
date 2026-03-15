@@ -1,12 +1,32 @@
+require("dotenv").config();
+
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
-const fetch = require("node-fetch");
+const axios = require("axios");
 const twilio = require("twilio");
 
+const helmet = require("helmet");
+const compression = require("compression");
+const rateLimit = require("express-rate-limit");
+const pino = require("pino");
+
+const logger = pino();
+
 const app = express();
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+app.use(helmet());
+app.use(compression());
+
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 120
+  })
+);
 
 const PORT = process.env.PORT || 3000;
 
@@ -391,15 +411,16 @@ function parseDelay(text) {
 // ============================================================
 
 async function tg(method, data) {
-  const res = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data)
-    }
-  );
-  return res.json();
+  try {
+    const res = await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,
+      data
+    );
+    return res.data;
+  } catch (err) {
+    logger.error("Telegram API error: " + err.message);
+    return null;
+  }
 }
 
 async function tgSend(chatId, text, buttons = null) {
@@ -1644,7 +1665,7 @@ setInterval(async () => {
     cleanupEndedCalls();
     saveDB();
   } catch {}
-}, 1000);
+}, 3000);
 
 // ============================================================
 // STARTUP
