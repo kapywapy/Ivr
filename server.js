@@ -35,6 +35,7 @@ const PORT = process.env.PORT || 3000;
 // ============================================================
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || "";
+const MY_PERSONAL_NUMBER = process.env.MY_PERSONAL_NUMBER || "";
 const OWNER_ID = String(process.env.OWNER_ID || "");
 const ADMIN_IDS = (process.env.ADMIN_IDS || "")
   .split(",")
@@ -524,48 +525,67 @@ async function tgSendDocument(chatId, filename, contentBuffer) {
 
 function panelButtons(chatId) {
   const role = getRole(chatId);
+  const call = newestActiveCallForUser(chatId);
+  const user = ensureUser(chatId);
 
+  // --- ACTIVE CALL CONTROLS (Shows only during a live call) ---
+  if (call) {
+    return [
+      [
+        { text: "✔ Confirm", callback_data: "confirm" },
+        { text: "🔁 Retry", callback_data: "retry" }
+      ],
+      [
+        { text: "🎧 Join Call", callback_data: "join_live" },
+        { text: user.isMuted ? "🎤 Speak (Unmute)" : "🔇 Mute (Whisper)", callback_data: "toggle_mute" }
+      ],
+      [
+        { text: "🎤 Send Text", callback_data: "talk" },
+        { text: "⛔ Hang Up", callback_data: "hangup" }
+      ],
+      [
+        { text: "🔄 Refresh Status", callback_data: "status" }
+      ]
+    ];
+  }
+
+  // --- IDLE SYSTEM CONTROLS (Shows when no call is active) ---
   const quickButtons = Object.entries(quickDialTargets)
     .filter(([, value]) => value)
     .slice(0, 3)
-    .map(([label]) => ({
-      text: `📲 ${label}`,
-      callback_data: `qd:${label}`
-    }));
+    .map(([label]) => ({ text: `📲 ${label}`, callback_data: `qd:${label}` }));
 
   const profileButtons = Object.keys(db.profiles)
     .slice(0, 4)
-    .map((name) => ({
-      text: `📁 ${name}`,
-      callback_data: `profile:${name}`
-    }));
+    .map((name) => ({ text: `📁 ${name}`, callback_data: `profile:${name}` }));
 
   const rows = [
     [
-      { text: "✔ Confirm", callback_data: "confirm" },
-      { text: "🔁 Retry", callback_data: "retry" }
-    ],
-    [{ text: "⛔ Hang Up", callback_data: "hangup" }],
-    [
       { text: "📞 Call Last", callback_data: "calllast" },
-      { text: "📲 Call", callback_data: "call" }
+      { text: "📲 Start Call", callback_data: "call" }
     ],
     [
-      { text: "🎤 Talk", callback_data: "talk" },
-      { text: "📋 Calls", callback_data: "showcalls" }
+      { text: "📋 Call History", callback_data: "showcalls" },
+      { text: "📊 Status", callback_data: "status" }
     ],
     [
-      {
-        text: settings.paused ? "▶ Resume" : "⏸ Pause",
-        callback_data: settings.paused ? "resume" : "pause"
-      }
+      { text: settings.paused ? "▶ Resume" : "⏸ Pause", callback_data: settings.paused ? "resume" : "pause" },
+      { text: "⚡ Wake Server", callback_data: "wake" }
     ],
-    [{ text: "⚡ Wake Server", callback_data: "wake" }],
-    [
-      { text: "📊 Status", callback_data: "status" },
-      { text: "📜 Logs", callback_data: "logs" }
-    ]
+    [{ text: "📜 Logs", callback_data: "logs" }]
   ];
+
+  if (quickButtons.length) rows.splice(1, 0, quickButtons);
+  if (profileButtons.length) rows.splice(2, 0, profileButtons);
+
+  if (role === "owner") {
+    rows.push([{ text: "👑 Owner Info", callback_data: "ownerinfo" }]);
+  } else if (role === "admin") {
+    rows.push([{ text: "🛡 Admin Info", callback_data: "admininfo" }]);
+  }
+
+  return rows;
+}
 
   if (quickButtons.length) rows.splice(3, 0, quickButtons);
   if (profileButtons.length) rows.splice(4, 0, profileButtons);
@@ -952,43 +972,46 @@ app.post("/call-status", async (req, res) => {
 // IVR START
 // ============================================================
 
+// --- NEW CONFERENCES ROUTE ---
+app.post("/join-monitor", async (req, res) => {
+  const ownerId = req.query.owner;
+  const call = newestActiveCallForUser(ownerId);
+  const user = ensureUser(ownerId);
+  
+  const twiml = new twilio.twiml.VoiceResponse();
+  const dial = twiml.dial();
+  dial.conference(call ? call.sid : "MonitorRoom", {
+    startConferenceOnEnter: true,
+    muted: user.isMuted, // You join muted by default
+    beep: false
+  });
+  
+  res.type("text/xml").send(twiml.toString());
+});
+
+// --- UPDATED IVR ROUTE ---
 app.post("/ivr", async (req, res) => {
   try {
-    const sid = req.body.CallSid;
-    const from = req.body.From;
     const ownerId = String(req.query.owner || OWNER_ID);
+    const callSid = req.body.CallSid;
+    const call = getOrCreateCall(callSid, ownerId);
 
-    const call = getOrCreateCall(sid, ownerId);
-    if (call) {
-      call.caller = from || call.caller;
-      call.status = settings.paused ? "Paused" : "Answered";
-      call.startedAt = call.startedAt || Date.now();
-      call.assistantIndex = settings.randomAssistant
-        ? Math.floor(Math.random() * assistants.length)
-        : settings.assistant;
-    }
+    const greet = template(settings.greeting, call);
+    const voice = assistantForCall(call).voice;
 
-    incStat("inboundCalls");
-    markUserDirty(ownerId);
-
-    res.type("text/xml");
-
-    if (settings.paused) {
-      return res.send(`
-<Response>
-<Say voice="${assistantForCall(call).voice}">
-Calling is currently paused. Please try again later.
-</Say>
-<Hangup/>
-</Response>
-`);
-    }
-
-    res.send(buildInputTwiml(call));
+    res.type("text/xml").send(`
+      <Response>
+        <Gather numDigits="${settings.digits}" action="${BASE_URL}/input?owner=${encodeURIComponent(ownerId)}" timeout="${settings.inputTimeout}">
+          <Say voice="${voice}">${greet}</Say>
+        </Gather>
+        <Dial>
+          <Conference beep="false" startConferenceOnEnter="true" endConferenceOnExit="true">${callSid}</Conference>
+        </Dial>
+      </Response>
+    `);
   } catch (e) {
-    console.log("/ivr error:", e.message);
-    res.type("text/xml");
-    res.send(`<Response><Say>Application error.</Say></Response>`);
+    logger.error("IVR Error: " + e.message);
+    res.type("text/xml").send("<Response><Hangup/></Response>");
   }
 });
 
