@@ -191,38 +191,20 @@ function saveDB() {
 
 loadDB();
 
+// ============================================================
+// SETTINGS / STATE
+// ============================================================
 
+let settings = db.settings;
 
-// ===================== Voice Assistant Setup =====================
 const assistants = [
-  { name: "Nova", voice: "Joanna-Neural" },   // Female, clear, natural
-  { name: "Lyra", voice: "Matthew-Neural" }, // Male, calm, professional
-  { name: "Orion", voice: "Amy-Neural" },    // Female, warm, friendly
-  { name: "Astra", voice: "Brian-Neural" },  // Male, neutral, natural
-  { name: "Kairo", voice: "Justin-Neural" }, // Male, modern, clear
-  { name: "Solara", voice: "Kendra-Neural"}  // Female, bright, confident
+{ name: "Nova", voice: "Polly.Joanna-Neural" },
+{ name: "Lyra", voice: "Polly.Matthew-Neural" },
+{ name: "Orion", voice: "Polly.Amy-Neural" },
+{ name: "Astra", voice: "Polly.Brian-Neural" },
+{ name: "Kairo", voice: "Polly.Justin-Neural" },
+{ name: "Solara", voice: "Polly.Kendra-Neural" }
 ];
-
-// Example function to generate Twilio TwiML dynamically
-function generateTwiML(assistantName, message) {
-  const assistant = assistants.find(a => a.name === assistantName);
-  if (!assistant) throw new Error("Assistant not found");
-
-  return `
-<Response>
-  <Say voice="${assistant.voice}" language="en-US">
-    ${message}
-  </Say>
-</Response>`;
-}
-
-// ================= Example Usage =================
-const twiml1 = generateTwiML("Nova", "Hello, welcome to our service!");
-const twiml2 = generateTwiML("Lyra", "Please enter your 4-digit PIN.");
-
-// twiml1 & twiml2 can now be sent directly to Twilio
-console.log(twiml1);
-console.log(twiml2);
 
 const quickDialTargets = {
   [QUICK_DIAL_A_LABEL]: QUICK_DIAL_A_NUMBER,
@@ -241,13 +223,6 @@ function getAdminIds() {
 // ============================================================
 // ROLES / AUTH
 // ============================================================
-
-
-// ============================================================
-// SETTINGS / STATE
-// ============================================================
-
-let settings = db.settings;
 
 function getRole(chatId) {
   const id = String(chatId || "");
