@@ -198,12 +198,12 @@ loadDB();
 let settings = db.settings;
 
 const assistants = [
-  { name: "Nova", voice: "Polly.Joanna" },
-  { name: "Lyra", voice: "Polly.Matthew" },
-  { name: "Orion", voice: "Polly.Amy" },
-  { name: "Astra", voice: "Polly.Brian" },
-  { name: "Kairo", voice: "Polly.Justin" },
-  { name: "Solara", voice: "Polly.Kendra" }
+{ name: "Nova", voice: "Polly.Joanna-Neural" },
+{ name: "Lyra", voice: "Polly.Matthew-Neural" },
+{ name: "Orion", voice: "Polly.Amy-Neural" },
+{ name: "Astra", voice: "Polly.Brian-Neural" },
+{ name: "Kairo", voice: "Polly.Justin-Neural" },
+{ name: "Solara", voice: "Polly.Kendra-Neural" }
 ];
 
 const quickDialTargets = {
